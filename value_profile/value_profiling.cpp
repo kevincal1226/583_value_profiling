@@ -14,45 +14,54 @@
 //
 //
 ////===-------------------------------------------------------------------===//
+#include <llvm-18/llvm/IR/IntrinsicInst.h>
+
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
-#include "llvm/Analysis/LoopInfo.h"
-#include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/LoopPass.h"
-#include "llvm/IR/CFG.h"
-#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
-#include "llvm/Support/Debug.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/Scalar/LoopPassManager.h"
+#include "llvm/ProfileData/InstrProf.h"
+#include "llvm/ProfileData/InstrProfData.inc"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
-#include "llvm/Transforms/Utils/SSAUpdater.h"
-
 /* *******Implementation Starts Here******* */
 // You can include more Header files here
 /* *******Implementation Ends Here******* */
 using namespace llvm;
 
 namespace {
-struct ValueProfile : public PassInfoMixin<ValueProfile> {
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) { return PreservedAnalyses::none(); }
+struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+        // TODO: pass for profiling the data somehow
+        return PreservedAnalyses::none();
+    }
+};
+
+struct ValueProfilePass : public PassInfoMixin<ValueProfilePass> {
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+        // TODO: actually do some silly fucking optimizations
+        return PreservedAnalyses::none();
+    }
 };
 }   // namespace
 
-extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() {
+extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPluginLibraryInfo {
     return { .APIVersion = LLVM_PLUGIN_API_VERSION,
-             .PluginName = "HW1Pass",
+             .PluginName = "ValueProfilingPass",
              .PluginVersion = "v0.1",
-             .RegisterPassBuilderCallbacks = [](PassBuilder& PB) {
+             .RegisterPassBuilderCallbacks = [](PassBuilder& PB) -> void {
                  PB.registerPipelineParsingCallback(
-                   [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) {
-                       if (Name == "value_profile") {
-                           FPM.addPass(ValueProfile());
+                   [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
+                       if (Name == "value_profiler") {
+                           FPM.addPass(ValueProfiler());
+                           return true;
+                       }
+                       if (Name == "value_profile_opt") {
+                           FPM.addPass(ValueProfilePass());
                            return true;
                        }
                        return false;
