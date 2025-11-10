@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+    echo "usage: ./driver.sh <path/to/file.cpp>"
+    exit 1
+fi
+
+IN="$1"
+
+# dirname + filename pieces
+DIR="$(dirname "$IN")"
+BASE="$(basename "$IN")"
+NAME="${BASE%.cpp}"
+
+OUT="${DIR}/${NAME}_inst.cpp"
+
+python3 value_profile/add_logs.py "$IN" "$OUT"
+
+mkdir -p build
+
+# compile
+g++ -std=c++23 -g "$OUT" -o "build/${NAME}"
+
+echo "generated: $OUT"
+echo "binary:    build/${NAME}"

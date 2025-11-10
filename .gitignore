@@ -1,3 +1,4 @@
 build/
 dot/
 .DS_Store
+logs/
