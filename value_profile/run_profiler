@@ -18,6 +18,7 @@ OUT="${DIR}/${NAME}_inst.cpp"
 python3 value_profile/add_logs.py "$IN" "$OUT"
 
 mkdir -p build
+mkdir -p logs
 
 # compile
 g++ -std=c++23 -g "$OUT" -o "build/${NAME}"
