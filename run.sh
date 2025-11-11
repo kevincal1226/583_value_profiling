@@ -99,7 +99,7 @@ clang -fprofile-instr-generate ${FILENAME}.ls.prof.bc -o ${FILENAME}_prof
 
 # Converting it to LLVM form. This step can also be used to combine multiple profraw files,
 # in case you want to include different profile runs together.
-llvm-profdata merge -o ${FILENAME}.profdata default.profraw
+llvm-profdata-20 merge -o ${FILENAME}.profdata default.profraw
 
 # The "Profile Guided Optimization Use" pass attaches the profile data to the bc file.
 opt -passes="pgo-instr-use" -o ${FILENAME}.profdata.bc -pgo-test-profile-file=${FILENAME}.profdata <${FILENAME}.ls.prof.bc >/dev/null
