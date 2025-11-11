@@ -2,3 +2,9 @@ build/
 dot/
 .DS_Store
 logs/
+*.bc
+*_fplicm
+*_prof
+*.profdata
+*.profraw
+*_output
