@@ -1,19 +1,16 @@
 #include <stdio.h>
 
-int foo(int, int) {
-    return 10;
-}
+int foo(int x, int y) { return x + 10 + y; }
 
-int bar(int, int) {
-    return 3;
-}
+int bar(int, int) { return 7; }
 
 int main() {
     for (int i = 0; i < 5; ++i) {
         int (*f)(int, int);
         if (i % 5 == 0) {
             f = foo;
-        } else {
+        }
+        else {
             f = bar;
         }
 
@@ -21,5 +18,8 @@ int main() {
 
         printf("%d", res);
     }
+
+    foo(1, 2);
+
     return 0;
 }
