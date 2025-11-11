@@ -74,9 +74,7 @@ for i, line in enumerate(lines):
 
         if names:
             chain = ' << " " << '.join([f'"{n}=" << {n}' for n in names])
-            new.append(
-                f'    g_log_file << "[LOG] {fname}" << " " << {chain} << std::endl;\n'
-            )
+            new.append(f'    g_log_file << "[LOG] {fname}" << " " << {chain} << std::endl;\n')
             for n in names:
                 new.append(f'    g_param_freq["{fname}::{n}"]++;\n')
         else:
@@ -90,10 +88,8 @@ for i, line in enumerate(lines):
     # multi-line
     new.append(line)
     if names:
-        chain = ' << " " << '.join([f'"{n}=" << {n}' for n in names])
-        new.append(
-            f'    g_log_file << "[LOG] {fname}" << " " << {chain} << std::endl;\n'
-        )
+        chain = ' << "," << '.join([f'"{n}=" << {n}' for n in names])
+        new.append(f'    g_log_file << "[LOG] {fname}" << " " << {chain} << std::endl;\n')
         for n in names:
             new.append(f'    g_param_freq["{fname}::{n}"]++;\n')
     else:
