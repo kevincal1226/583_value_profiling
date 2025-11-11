@@ -163,6 +163,6 @@ if $generate_viz; then
 fi
 
 # Cleanup: Remove this if you want to retain the created files.
-rm -f default.profraw *_prof *_fplicm *.bc *.profdata *_output *.ll
+# rm -f default.profraw *_prof *_fplicm *.bc *.profdata *_output *.ll
 
 cd $CURRENT_DIR
