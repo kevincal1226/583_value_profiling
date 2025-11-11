@@ -83,7 +83,7 @@ cd $(dirname $SRC_FILE)
 rm -f default.profraw *_prof *_fplicm *.bc *.profdata *_output *.ll
 
 # Convert source code to bitcode (IR).
-clang -emit-llvm -c ${FILENAME}.c -Xclang -disable-O0-optnone -o ${FILENAME}.bc --fno-discard-value-names
+clang -emit-llvm -c ${FILENAME}.c -Xclang -disable-O0-optnone -o ${FILENAME}.bc -fno-discard-value-names
 
 # Canonicalize natural loops (Ref: llvm.org/doxygen/LoopSimplify_8h_source.html)
 opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.ls.bc
