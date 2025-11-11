@@ -40,21 +40,21 @@ using namespace llvm;
 
 namespace {
 struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
-    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
         // NOTE: i do not owe anyone $5; i added ALL consts AFTER writing the code
         auto const module = F.getParent();
         auto const foo_function = module->getFunction("foo");
 
         for (auto bb_it = F.begin(); bb_it != F.end();) {
-            auto &next_bb = *bb_it++;
+            auto& next_bb = *bb_it++;
 
             for (auto instruction_it = next_bb.begin(); instruction_it != next_bb.end();) {
-                auto &instruction = *instruction_it++;
+                auto& instruction = *instruction_it++;
                 auto const call_instr = dyn_cast<CallInst>(&instruction);
 
                 if (call_instr != nullptr && call_instr->getCalledFunction() == nullptr && foo_function != nullptr) {
                     // split returns the first half
-                    BasicBlock *first_half_bb = next_bb.splitBasicBlockBefore(&instruction);
+                    BasicBlock* first_half_bb = next_bb.splitBasicBlockBefore(&instruction);
 
                     IRBuilder<> bb_builder(first_half_bb);
                     first_half_bb->getTerminator()->eraseFromParent();
@@ -98,29 +98,29 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
 };
 
 struct ValueProfilePass : public PassInfoMixin<ValueProfilePass> {
-    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
         // TODO: actually do some silly fucking optimizations
         return PreservedAnalyses::none();
     }
 };
-} // namespace
+}   // namespace
 
 extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPluginLibraryInfo {
-    return {.APIVersion = LLVM_PLUGIN_API_VERSION,
-            .PluginName = "ValueProfilingPass",
-            .PluginVersion = "v0.1",
-            .RegisterPassBuilderCallbacks = [](PassBuilder &PB) -> void {
-                PB.registerPipelineParsingCallback(
-                    [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
-                        if (Name == "value_profiler") {
-                            FPM.addPass(ValueProfiler());
-                            return true;
-                        }
-                        if (Name == "value_profile_opt") {
-                            FPM.addPass(ValueProfilePass());
-                            return true;
-                        }
-                        return false;
-                    });
-            }};
+    return { .APIVersion = LLVM_PLUGIN_API_VERSION,
+             .PluginName = "ValueProfilingPass",
+             .PluginVersion = "v0.1",
+             .RegisterPassBuilderCallbacks = [](PassBuilder& PB) -> void {
+                 PB.registerPipelineParsingCallback(
+                   [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
+                       if (Name == "value_profiler") {
+                           FPM.addPass(ValueProfiler());
+                           return true;
+                       }
+                       if (Name == "value_profile_opt") {
+                           FPM.addPass(ValueProfilePass());
+                           return true;
+                       }
+                       return false;
+                   });
+             } };
 }

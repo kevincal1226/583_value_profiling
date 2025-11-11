@@ -9,9 +9,17 @@ int bar(int, int) {
 }
 
 int main() {
-    int (*f)(int, int) = bar;
-    int res = f(0, 0);
+    for (int i = 0; i < 5; ++i) {
+        int (*f)(int, int);
+        if (i % 5 == 0) {
+            f = foo;
+        } else {
+            f = bar;
+        }
 
-    printf("%d", res);
+        int res = f(0, 0);
+
+        printf("%d", res);
+    }
     return 0;
 }

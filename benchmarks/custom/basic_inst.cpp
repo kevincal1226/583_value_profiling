@@ -18,6 +18,12 @@ int bar(int y) {
     return y * 1000;
 }
 
+int baz(int x, int y) {
+    g_log_file << "[LOG] baz" << " " << "x=" << x << " " << "y=" << y << std::endl;
+    g_param_freq["baz::x"]++;
+    g_param_freq["baz::y"]++;
+    return 0;
+}
 
 int main() {
     g_log_file << "[LOG] main no args" << std::endl;
