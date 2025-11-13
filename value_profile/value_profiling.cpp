@@ -62,7 +62,7 @@ struct VariableStats {
 
         for (auto [value, count] : values) {
 
-            if (count > total * 0.9) {
+            if (count > total * 0.5) {
                 return value;
             }
         }
@@ -74,12 +74,7 @@ struct VariableStats {
 struct ProfileResult {
     std::unordered_map<std::string, VariableStats> results;
 
-    int total = 0;
-
-    auto add(const std::string &variable, int value, int count) -> void {
-        total += count;
-        results[variable].add(value, count);
-    }
+    auto add(const std::string &variable, int value, int count) -> void { results[variable].add(value, count); }
 
     auto get_variable_stats(const std::string &func) -> VariableStats & { return results[func]; }
 };
@@ -195,21 +190,29 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
                     ValueToValueMapTy VMap;
 
                     auto dstAI = new_function->arg_begin();
+
+                    SmallVector<Value *, 8> newCallArgs;
+
                     for (unsigned i = 0; i < func->arg_size(); ++i) {
                         Argument &srcArg = *(func->arg_begin() + i);
-
                         auto &variableStats = funcStats.get_variable_stats(srcArg.getName().str());
-
                         auto value = variableStats.get_frequent_value();
 
                         if (value) {
                             VMap[&srcArg] = ConstantInt::get(Type::getInt32Ty(func->getContext()), *value);
                         }
+                        else {
+                            newCallArgs.push_back(call_instr->getArgOperand(i));
+
+                            dstAI->setName(srcArg.getName());
+                            VMap[&srcArg] = &*dstAI;
+                            ++dstAI;
+                        }
                     }
                     SmallVector<ReturnInst *, 4> returns;
                     CloneFunctionInto(new_function, func, VMap, CloneFunctionChangeType::DifferentModule, returns);
 
-                    auto const new_call_instr = CallInst::Create(new_function_type, new_function);
+                    auto const new_call_instr = CallInst::Create(new_function_type, new_function, newCallArgs);
 
                     auto const bb_true = BasicBlock::Create(F.getContext(), "new_func", &F, &next_bb);
                     IRBuilder<> bb_true_builder(bb_true);
@@ -220,6 +223,7 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
                     auto const bb_false = BasicBlock::Create(F.getContext(), "old_func", &F, &next_bb);
                     IRBuilder<> bb_false_builder(bb_false);
                     auto cloned_call = call_instr->clone();
+
                     bb_false_builder.Insert(cloned_call);
                     bb_false_builder.CreateBr(&next_bb);
 

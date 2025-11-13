@@ -90,8 +90,6 @@ for i, line in enumerate(lines):
         new.append(f'    g_log_file << "{fname}" << " " << {chain} << std::endl;\n')
         for n in names:
             new.append(f'    g_param_freq["{fname}::{n}"]++;\n')
-    else:
-        new.append(f'    g_log_file << "{fname} no args" << std::endl;\n')
 
 # inject global setup if missing
 if not any("std::ofstream g_log_file" in l for l in new):
