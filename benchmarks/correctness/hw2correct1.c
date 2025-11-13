@@ -19,10 +19,9 @@ int main() {
     //     printf("%d", res);
     // }
 
-    foo(1, 2);
-    foo(2, 2);
-    foo(3, 3);
-    foo(4, 2);
+    printf("%d\n", foo(2, 2));
+    printf("%d\n", foo(3, 3));
+    printf("%d\n", foo(4, 2));
 
     return 0;
 }
