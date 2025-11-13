@@ -2,7 +2,7 @@
 
 int foo(int x, int y) { return x + 10 + y; }
 
-int bar(int, int) { return 7; }
+int bar(int z, int i) { return 7; }
 
 int main() {
     for (int i = 0; i < 5; ++i) {
@@ -20,6 +20,9 @@ int main() {
     }
 
     foo(1, 2);
+    foo(2, 2);
+    foo(3, 3);
+    foo(4, 2);
 
     return 0;
 }

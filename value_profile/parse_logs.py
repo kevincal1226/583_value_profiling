@@ -3,7 +3,6 @@
 
 import sys
 from collections import defaultdict
-from icecream import ic
 
 if len(sys.argv) != 3 and len(sys.argv) != 2:
     print("usage: add_logs.py [logfile.txt] <optional n (default = 5)>")
@@ -25,17 +24,19 @@ for line in lines:
     if "no args" in line:
         continue
 
-    _, func, vars = line.split(" ")
+    func, _, vars = line.partition(" ")
     call_cnt[func] += 1
 
-    for v in vars.split(","):
+    for v in vars.split(" "):
         varname, var = v.split("=")
         var = int(var)
 
         tnv_table[func][varname][var] += 1
 
         if len(tnv_table[func][varname]) > top_n:
-            tnv_table[func][varname].pop(min(tnv_table[func][varname].items(), key=lambda b: b[1])[0])
+            tnv_table[func][varname].pop(
+                min(tnv_table[func][varname].items(), key=lambda b: b[1])[0]
+            )
 
 outfile = logfile.removesuffix(".txt") + "profdata.txt"
 with open(outfile, "w") as f:

@@ -1,25 +1,44 @@
 #include <fstream>
 #include <unordered_map>
 #include <string>
-std::ofstream g_log_file("runtime_log.txt");
+std::ofstream g_log_file("logs/hw2correct1.c.txt");
 std::unordered_map<std::string, size_t> g_param_freq;
 
 #include <stdio.h>
 
-int foo(int, int) { return 10; }
+int foo(int x, int y) {
+    g_log_file << "foo" << " " << "x=" << x << " " << "y=" << y << std::endl;
+    g_param_freq["foo::x"]++;
+    g_param_freq["foo::y"]++;
+    return x + 10 + y;
+}
 
-int bar(int x, int y) {
-    g_log_file << "function bar" << " " << "x=" << x << " " << "y=" << y << std::endl;
-    g_param_freq["bar::x"]++;
-    g_param_freq["bar::y"]++;
-    return 3;
+
+int bar(int z, int i) {
+    g_log_file << "bar" << " " << "z=" << z << " " << "i=" << i << std::endl;
+    g_param_freq["bar::z"]++;
+    g_param_freq["bar::i"]++;
+    return 7;
 }
 
 
 int main() {
-    int (*f)(int, int) = bar;
-    int res = f(0, 0);
+    g_log_file << "main no args" << std::endl;
+    for (int i = 0; i < 5; ++i) {
+        int (*f)(int, int);
+        if (i % 5 == 0) {
+            f = foo;
+        }
+        else {
+            f = bar;
+        }
 
-    printf("%d", res);
+        int res = f(0, 0);
+
+        printf("%d", res);
+    }
+
+    foo(1, 2);
+
     return 0;
 }

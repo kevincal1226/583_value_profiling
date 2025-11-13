@@ -35,29 +35,118 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+
 /* *******Implementation Starts Here******* */
 // You can include more Header files here
 /* *******Implementation Ends Here******* */
 using namespace llvm;
 
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 
 namespace {
+
+struct VariableStats {
+    std::unordered_map<int, int> values;
+
+    int total = 0;
+
+    auto add(int value, int count) -> void {
+        total += count;
+        values[value] += count;
+    }
+
+    auto get_frequent_value() -> std::optional<int> {
+
+        for (auto [value, count] : values) {
+
+            if (count > total * 0.9) {
+                return value;
+            }
+        }
+
+        return {};
+    }
+};
+
+struct ProfileResult {
+    std::unordered_map<std::string, VariableStats> results;
+
+    int total = 0;
+
+    auto add(const std::string &variable, int value, int count) -> void {
+        total += count;
+        results[variable].add(value, count);
+    }
+
+    auto get_variable_stats(const std::string &func) -> VariableStats & { return results[func]; }
+};
+
+std::unordered_map<std::string, ProfileResult> parseStats(const std::string &filename) {
+    std::ifstream file(filename);
+
+    std::string line;
+
+    std::unordered_map<std::string, ProfileResult> output;
+
+    while (std::getline(file, line)) {
+        std::stringstream ss(line);
+
+        std::string func_name;
+        std::string variable;
+        int value, count;
+        double freq;
+
+        std::string temp;
+
+        std::getline(ss, func_name, ','); // foo
+
+        std::getline(ss, variable, ','); // x
+
+        std::getline(ss, temp, ','); // 0
+        value = std::stoi(temp);
+
+        std::getline(ss, temp, ','); // 1
+        count = std::stoi(temp);
+
+        std::getline(ss, temp, ','); // 0.5
+        freq = std::stod(temp);
+
+        output[func_name].add(variable, value, count);
+
+        errs() << "FUNCTION: " << func_name << " " << variable << " " << count << "\n ";
+    }
+
+    return output;
+}
+
 struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
         // NOTE: i do not owe anyone $5; i added ALL consts AFTER writing the code
+
+        errs() << "STARTING PASS\n";
+
+        std::string cwd = std::filesystem::current_path().string();
+        llvm::errs() << "Pass running in directory: " << cwd << "\n";
+
+        auto stats = parseStats("../../profile_stats.txt");
+
+        errs() << "COLLECTED STATS\n";
 
         auto const module = F.getParent();
         auto const foo_function = module->getFunction("foo");
 
         for (auto bb_it = F.begin(); bb_it != F.end();) {
-            auto& next_bb = *bb_it++;
+            auto &next_bb = *bb_it++;
 
             for (auto instruction_it = next_bb.begin(); instruction_it != next_bb.end();) {
-                auto& instruction = *instruction_it++;
+                auto &instruction = *instruction_it++;
                 auto const call_instr = dyn_cast<CallInst>(&instruction);
 
-                if (call_instr != nullptr && call_instr->getCalledFunction() != nullptr) {
+                if (call_instr != nullptr && call_instr->getCalledFunction() != nullptr &&
+                    stats.contains(call_instr->getCalledFunction()->getName().str())) {
 
                     errs() << "here: " << call_instr->getCalledFunction()->getName() << "\n";
 
@@ -83,6 +172,20 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
 
                     SmallVector<Type *, 8> newParamTys;
 
+                    auto &funcStats = stats[call_instr->getCalledFunction()->getName().str()];
+
+                    for (unsigned i = 0; i < func->arg_size(); ++i) {
+                        Argument &srcArg = *(func->arg_begin() + i);
+
+                        auto &variableStats = funcStats.get_variable_stats(srcArg.getName().str());
+
+                        errs() << "CHECKING VARIABLE " << srcArg.getName() << "\n";
+
+                        if (!variableStats.get_frequent_value()) {
+                            newParamTys.push_back(srcArg.getType());
+                        }
+                    }
+
                     FunctionType *new_function_type =
                         FunctionType::get(func->getReturnType(), newParamTys, func->isVarArg());
 
@@ -95,7 +198,13 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
                     for (unsigned i = 0; i < func->arg_size(); ++i) {
                         Argument &srcArg = *(func->arg_begin() + i);
 
-                        VMap[&srcArg] = ConstantInt::get(Type::getInt32Ty(func->getContext()), 69);
+                        auto &variableStats = funcStats.get_variable_stats(srcArg.getName().str());
+
+                        auto value = variableStats.get_frequent_value();
+
+                        if (value) {
+                            VMap[&srcArg] = ConstantInt::get(Type::getInt32Ty(func->getContext()), *value);
+                        }
                     }
                     SmallVector<ReturnInst *, 4> returns;
                     CloneFunctionInto(new_function, func, VMap, CloneFunctionChangeType::DifferentModule, returns);
@@ -129,7 +238,7 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
 
                 if (call_instr != nullptr && call_instr->getCalledFunction() == nullptr && foo_function != nullptr) {
                     // split returns the first half
-                    BasicBlock* first_half_bb = next_bb.splitBasicBlockBefore(&instruction);
+                    BasicBlock *first_half_bb = next_bb.splitBasicBlockBefore(&instruction);
 
                     IRBuilder<> bb_builder(first_half_bb);
                     first_half_bb->getTerminator()->eraseFromParent();
@@ -173,29 +282,29 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
 };
 
 struct ValueProfilePass : public PassInfoMixin<ValueProfilePass> {
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
         // TODO: actually do some silly fucking optimizations
         return PreservedAnalyses::none();
     }
 };
-}   // namespace
+} // namespace
 
 extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPluginLibraryInfo {
-    return { .APIVersion = LLVM_PLUGIN_API_VERSION,
-             .PluginName = "ValueProfilingPass",
-             .PluginVersion = "v0.1",
-             .RegisterPassBuilderCallbacks = [](PassBuilder& PB) -> void {
-                 PB.registerPipelineParsingCallback(
-                   [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
-                       if (Name == "value_profiler") {
-                           FPM.addPass(ValueProfiler());
-                           return true;
-                       }
-                       if (Name == "value_profile_opt") {
-                           FPM.addPass(ValueProfilePass());
-                           return true;
-                       }
-                       return false;
-                   });
-             } };
+    return {.APIVersion = LLVM_PLUGIN_API_VERSION,
+            .PluginName = "ValueProfilingPass",
+            .PluginVersion = "v0.1",
+            .RegisterPassBuilderCallbacks = [](PassBuilder &PB) -> void {
+                PB.registerPipelineParsingCallback(
+                    [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
+                        if (Name == "value_profiler") {
+                            FPM.addPass(ValueProfiler());
+                            return true;
+                        }
+                        if (Name == "value_profile_opt") {
+                            FPM.addPass(ValueProfilePass());
+                            return true;
+                        }
+                        return false;
+                    });
+            }};
 }
