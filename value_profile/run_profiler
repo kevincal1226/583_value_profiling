@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+
+set -Eeuo pipefail
 
 if [[ $# -ne 1 ]]; then
     echo "usage: ./driver.sh <path/to/file.cpp>"
@@ -25,3 +26,16 @@ g++ -std=c++23 -g "$OUT" -o "build/${NAME}"
 
 echo "generated: $OUT"
 echo "binary:    build/${NAME}"
+
+# run program and collect values
+g++ -std=c++23 -g "$OUT"
+
+./a.out >/dev/null
+
+rm a.out
+
+echo "generated profile data"
+
+./value_profile/parse_logs.py logs/${BASE}.txt
+
+echo "parsed profile data"

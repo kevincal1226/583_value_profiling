@@ -10,3 +10,4 @@ logs/
 *_output
 env/
 *_value_profiled
+*.dSYM/

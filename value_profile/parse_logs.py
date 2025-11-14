@@ -38,7 +38,7 @@ for line in lines:
                 min(tnv_table[func][varname].items(), key=lambda b: b[1])[0]
             )
 
-outfile = logfile.removesuffix(".txt") + "profdata.txt"
+outfile = logfile.removesuffix(".txt") + "_profdata.txt"
 with open(outfile, "w") as f:
     for func, var_map in tnv_table.items():
         for var, val_map in var_map.items():
