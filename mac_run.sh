@@ -119,6 +119,9 @@ rm -f default.profraw *_prof *_fplicm *.bc *.profdata *_output *.ll
 # Convert source code to bitcode (IR).
 clang -emit-llvm -fno-discard-value-names -c ${FILENAME}.cpp -Xclang -disable-O0-optnone -o ${FILENAME}.bc
 
+# Canonicalize natural loops (Ref: llvm.org/doxygen/LoopSimplify_8h_source.html)
+opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.bc
+
 # We now use the profile augmented bc file as input to your pass.
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_profiled.bc >/dev/null
 
