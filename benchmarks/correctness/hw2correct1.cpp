@@ -1,8 +1,12 @@
 #include <stdio.h>
 
-int foo(int x, int y) { return x + 10 + y; }
+int foo(int x, int y) {
+    return x + 10 + y;
+}
 
-int bar(int z, int i) { return 7; }
+int bar(int z, int i) {
+    return 7;
+}
 
 int main() {
     // for (int i = 0; i < 5; ++i) {

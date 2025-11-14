@@ -15,6 +15,9 @@
 //
 ////===-------------------------------------------------------------------===//
 
+#include <string_view>
+#include <unordered_map>
+
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstrTypes.h>
@@ -47,9 +50,34 @@ using namespace llvm;
 #include <iostream>
 #include <sstream>
 
+using prof_map_t = std::unordered_map<std::string, std::unordered_map<std::string, std::unordered_map<int, double>>>;
+
 namespace {
 
+auto parse_data() -> prof_map_t {
+    prof_map_t prof_data;
+    std::string filename { "../../profile_stats.txt" };
+    std::ifstream ifs { filename };
+    std::string func_name;
+    std::string var_name;
+    std::string value_str;
+    std::string frequency_str;
+    std::string probability_str;
+    while (std::getline(ifs, func_name, ','), std::getline(ifs, var_name, ','), std::getline(ifs, value_str, ','),
+           std::getline(ifs, frequency_str, ','), std::getline(ifs, probability_str)) {
+        int value { std::stoi(value_str) };
+        double probability { std::stod(probability_str) };
+        prof_data[func_name][var_name][value] = probability;
+    }
+
+    return prof_data;
+}
+
 struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
+    prof_map_t prof_map {};
+    ValueProfiler() = default;
+    ValueProfiler(prof_map_t&& prof_map)
+        : prof_map(std::move(prof_map)) {}
     PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) { return PreservedAnalyses::none(); }
 };
 
@@ -63,11 +91,7 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                  PB.registerPipelineParsingCallback(
                    [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
                        if (Name == "value_profiler") {
-                           FPM.addPass(ValueProfiler());
-                           return true;
-                       }
-                       if (Name == "value_profile_opt") {
-                           FPM.addPass(ValueProfiler());
+                           FPM.addPass(ValueProfiler(parse_data()));
                            return true;
                        }
                        return false;

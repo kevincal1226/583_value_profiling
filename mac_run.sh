@@ -2,7 +2,6 @@
 # Run script for Homework 2 CSE 583 Fall 2025
 # e.g. sh run.sh benchmarks/correctness/hw2correct1.c
 set -e
-set -x
 set -Eeuo pipefail
 
 # ACTION NEEDED: If the path is different, please update it here.
