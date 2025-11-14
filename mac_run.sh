@@ -8,6 +8,12 @@ set -Eeuo pipefail
 # ACTION NEEDED: If the path is different, please update it here.
 LIB="build/value_profile/ValueProfilingPass.dylib"
 
+mkdir -p build
+cd build
+cmake ..
+make
+cd ..
+
 if [ ! -f "$LIB" ]; then
     echo "Could not find $LIB. Please build your pass or correct the path in the script."
     exit 1
