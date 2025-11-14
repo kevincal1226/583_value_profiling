@@ -18,6 +18,7 @@
 #include <string_view>
 #include <unordered_map>
 
+#include <llvm/Demangle/Demangle.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstrTypes.h>
@@ -56,16 +57,20 @@ namespace {
 
 auto parse_data(std::string&& filename) -> prof_map_t {
     prof_map_t prof_data;
+
     std::ifstream ifs { filename };
+
     std::string func_name;
     std::string var_name;
     std::string value_str;
     std::string frequency_str;
     std::string probability_str;
+
     while (std::getline(ifs, func_name, ','), std::getline(ifs, var_name, ','), std::getline(ifs, value_str, ','),
            std::getline(ifs, frequency_str, ','), std::getline(ifs, probability_str)) {
         int value { std::stoi(value_str) };
         double probability { std::stod(probability_str) };
+
         prof_data[func_name][var_name][value] = probability;
     }
 
@@ -73,11 +78,23 @@ auto parse_data(std::string&& filename) -> prof_map_t {
 }
 
 struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
-    prof_map_t prof_map {};
-    ValueProfiler() = default;
+    prof_map_t prof_map;
+
     ValueProfiler(prof_map_t&& prof_map)
         : prof_map(std::move(prof_map)) {}
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) { return PreservedAnalyses::none(); }
+
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+        std::string demanged_func_name = llvm::demangle(F.getName().str());
+        std::string func_name = demanged_func_name.contains('(')
+                                ? demanged_func_name.erase(demanged_func_name.find_first_of('('))
+                                : demanged_func_name;
+        if (prof_map.contains(func_name)) {
+            errs() << "FUNCTION " << func_name << " EXISTS IN MAP\n";
+        } else {
+            errs() << "FUNCTION " << func_name << " DOES NOT EXIST IN MAP\n";
+        }
+        return PreservedAnalyses::none();
+    }
 };
 
 }   // namespace
