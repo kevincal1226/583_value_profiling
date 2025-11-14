@@ -92,36 +92,42 @@ cd $(dirname $SRC_FILE)
 rm -f default.profraw *_prof *_fplicm *.bc *.profdata *_output *.ll
 
 # Convert source code to bitcode (IR).
+# clang -emit-llvm -fno-discard-value-names -c ${FILENAME}.cpp -Xclang -disable-O0-optnone -o ${FILENAME}.bc
+#
+# # Canonicalize natural loops (Ref: llvm.org/doxygen/LoopSimplify_8h_source.html)
+# opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.ls.bc
+#
+# # Instrument profiler passes.
+# opt -passes='pgo-instr-gen,instrprof' ${FILENAME}.ls.bc -o ${FILENAME}.ls.prof.bc
+#
+# # Generate binary executable with profiler embedded
+# clang -fprofile-instr-generate ${FILENAME}.ls.prof.bc -o ${FILENAME}_prof
+#
+# # When we run the profiler embedded executable, it generates a default.profraw file that contains the profile data.
+# ./${FILENAME}_prof >correct_output
+#
+# # Converting it to LLVM form. This step can also be used to combine multiple profraw files,
+# # in case you want to include different profile runs together.
+# llvm-profdata merge -o ${FILENAME}.profdata default.profraw
+#
+# # The "Profile Guided Optimization Use" pass attaches the profile data to the bc file.
+# opt -passes="pgo-instr-use" -o ${FILENAME}.profdata.bc -pgo-test-profile-file=${FILENAME}.profdata <${FILENAME}.ls.prof.bc >/dev/null
+#
+# # We now use the profile augmented bc file as input to your pass.
+# opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.profdata.bc -o ${FILENAME}.value_profiled.bc >/dev/null
+
+# Convert source code to bitcode (IR).
 clang -emit-llvm -fno-discard-value-names -c ${FILENAME}.cpp -Xclang -disable-O0-optnone -o ${FILENAME}.bc
 
-# Canonicalize natural loops (Ref: llvm.org/doxygen/LoopSimplify_8h_source.html)
-opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.ls.bc
-
-# Instrument profiler passes.
-opt -passes='pgo-instr-gen,instrprof' ${FILENAME}.ls.bc -o ${FILENAME}.ls.prof.bc
-
-# Generate binary executable with profiler embedded
-clang -fprofile-instr-generate ${FILENAME}.ls.prof.bc -o ${FILENAME}_prof
-
-# When we run the profiler embedded executable, it generates a default.profraw file that contains the profile data.
-./${FILENAME}_prof >correct_output
-
-# Converting it to LLVM form. This step can also be used to combine multiple profraw files,
-# in case you want to include different profile runs together.
-llvm-profdata merge -o ${FILENAME}.profdata default.profraw
-
-# The "Profile Guided Optimization Use" pass attaches the profile data to the bc file.
-opt -passes="pgo-instr-use" -o ${FILENAME}.profdata.bc -pgo-test-profile-file=${FILENAME}.profdata <${FILENAME}.ls.prof.bc >/dev/null
-
 # We now use the profile augmented bc file as input to your pass.
-opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.profdata.bc -o ${FILENAME}.value_profiled.bc >/dev/null
+opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_profiled.bc >/dev/null
 
 # Generate binary excutable before FPLICM: Unoptimzed code
-clang -fprofile-instr-generate ${FILENAME}.ls.bc -o ${FILENAME}_not_value_profiled
+clang -fprofile-instr-generate ${FILENAME}.bc -o ${FILENAME}_not_value_profiled
 # Generate binary executable after FPLICM: Optimized code
 clang -fprofile-instr-generate ${FILENAME}.value_profiled.bc -o ${FILENAME}_value_profiled
 
-rm ${FILENAME}.bc ${FILENAME}.ls.bc ${FILENAME}.ls.prof.bc ${FILENAME}.profdata ${FILENAME}.profdata.bc default.profraw ${FILENAME}_prof
+rm ${FILENAME}.bc
 
 generate_cfg_viz() {
     VIZ_TYPE=cfg
