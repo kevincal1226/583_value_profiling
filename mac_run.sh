@@ -2,16 +2,11 @@
 # Run script for Homework 2 CSE 583 Fall 2025
 # e.g. sh run.sh benchmarks/correctness/hw2correct1.c
 set -e
+set -x
 set -Eeuo pipefail
 
-mkdir -p build
-cd build
-cmake ..
-make
-cd ..
-
 # ACTION NEEDED: If the path is different, please update it here.
-LIB="build/hw2pass/HW2Pass.dylib"
+LIB="build/value_profile/ValueProfilingPass.dylib"
 
 if [ ! -f "$LIB" ]; then
     echo "Could not find $LIB. Please build your pass or correct the path in the script."
@@ -21,11 +16,9 @@ fi
 PATH2LIB=$(realpath "$LIB")
 
 CURRENT_DIR=$(pwd)
-CORRECTNESS_PASS=fplicm-correctness
-PERFORMANCE_PASS=fplicm-performance
 
 # Default to correctness pass
-SELECTED_PASS=fplicm-correctness
+SELECTED_PASS=value_profiler
 flag_set=false
 generate_viz=false
 
@@ -34,8 +27,6 @@ show_help() {
 Usage: $0 [-c|-p][-v] <source_file>
 
 Options:
-  -c                Run the correctness pass (default)
-  -p                Run the performance pass
   -v                Generate visualization of CFG
   -h                Show this help message and exit
 
@@ -53,22 +44,6 @@ EOF
 # Parse options
 while getopts ":cpvh" opt; do
     case $opt in
-    c)
-        if $flag_set; then
-            echo "Error: -c and -p cannot be used together" >&2
-            exit 1
-        fi
-        SELECTED_PASS=fplicm-correctness
-        flag_set=true
-        ;;
-    p)
-        if $flag_set; then
-            echo "Error: -c and -p cannot be used together" >&2
-            exit 1
-        fi
-        SELECTED_PASS=fplicm-performance
-        flag_set=true
-        ;;
     v)
         generate_viz=true
         ;;
@@ -102,6 +77,8 @@ fi
 
 SRC_FILE=$1
 FILE_BASENAME=$(basename $SRC_FILE)
+# this is to run cpp files and not just c files
+# FILENAME=$FILE_BASENAME
 FILENAME=${FILE_BASENAME%.*}
 
 cd $(dirname $SRC_FILE)
@@ -110,7 +87,7 @@ cd $(dirname $SRC_FILE)
 rm -f default.profraw *_prof *_fplicm *.bc *.profdata *_output *.ll
 
 # Convert source code to bitcode (IR).
-clang -emit-llvm -fno-discard-value-names -c ${FILENAME}.c -Xclang -disable-O0-optnone -o ${FILENAME}.bc
+clang -emit-llvm -fno-discard-value-names -c ${FILENAME}.cpp -Xclang -disable-O0-optnone -o ${FILENAME}.bc
 
 # Canonicalize natural loops (Ref: llvm.org/doxygen/LoopSimplify_8h_source.html)
 opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.ls.bc
@@ -132,29 +109,14 @@ llvm-profdata merge -o ${FILENAME}.profdata default.profraw
 opt -passes="pgo-instr-use" -o ${FILENAME}.profdata.bc -pgo-test-profile-file=${FILENAME}.profdata <${FILENAME}.ls.prof.bc >/dev/null
 
 # We now use the profile augmented bc file as input to your pass.
-opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.profdata.bc -o ${FILENAME}.fplicm.bc >/dev/null
+opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.profdata.bc -o ${FILENAME}.value_profiled.bc >/dev/null
 
 # Generate binary excutable before FPLICM: Unoptimzed code
-clang -fprofile-instr-generate ${FILENAME}.ls.bc -o ${FILENAME}_no_fplicm
+clang -fprofile-instr-generate ${FILENAME}.ls.bc -o ${FILENAME}_not_value_profiled
 # Generate binary executable after FPLICM: Optimized code
-clang -fprofile-instr-generate ${FILENAME}.fplicm.bc -o ${FILENAME}_fplicm
+clang -fprofile-instr-generate ${FILENAME}.value_profiled.bc -o ${FILENAME}_value_profiled
 
-# Produce output from binary to check correctness
-./${FILENAME}_fplicm >fplicm_output
-
-echo -e "\n=== Program Correctness Validation ==="
-if [ "$(diff correct_output fplicm_output)" != "" ]; then
-    echo -e ">> Outputs do not match\n"
-else
-    echo -e ">> Outputs match\n"
-    # Measure performance
-    echo -e "1. Performance of unoptimized code"
-    time ./${FILENAME}_no_fplicm >/dev/null
-    echo -e "\n"
-    echo -e "2. Performance of optimized code"
-    time ./${FILENAME}_fplicm >/dev/null
-    echo -e "\n"
-fi
+rm ${FILENAME}.bc ${FILENAME}.ls.bc ${FILENAME}.ls.prof.bc ${FILENAME}.profdata ${FILENAME}.profdata.bc default.profraw ${FILENAME}_prof
 
 generate_cfg_viz() {
     VIZ_TYPE=cfg
@@ -194,11 +156,9 @@ generate_cfg_viz() {
     else
         DOT_FILES=$(ls *.dot)
     fi
-    # cat $DOT_FILES | dot -Tpdf >$OUTPUT_DIR/$BENCH.$VIZ_TYPE.pdf
-    # echo "Created $BENCH.$VIZ_TYPE.pdf"
-    cd - >/dev/null
-    cat $TMP_DIR/.main.dot | dot -Tpdf >$OUTPUT_DIR/${BENCH}.pdf
+    cat $DOT_FILES | dot -Tpdf >$OUTPUT_DIR/$BENCH.$VIZ_TYPE.pdf
     echo "Created $BENCH.$VIZ_TYPE.pdf"
+    cd - >/dev/null
     rm -rf $TMP_DIR
 
 }
@@ -209,6 +169,6 @@ if $generate_viz; then
 fi
 
 # Cleanup: Remove this if you want to retain the created files.
-rm -f default.profraw *_prof *_fplicm *.bc *.profdata *_output *.ll
+# rm -f default.profraw *_prof *_fplicm *.bc *.profdata *_output *.ll
 
 cd $CURRENT_DIR

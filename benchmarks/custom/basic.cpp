@@ -1,15 +1,18 @@
-#include <iostream>
+#include <stdio.h>
 
-int foo(int x) { return x + 8; }
-int bar(int y) { return y * 1000; }
+int foo(int x) {
+    return x + 8;
+}
+int bar(int y) {
+    return y * 1000;
+}
 
 int main() {
-
     for (int i = 0; i < 1000; ++i) {
-        std::cout << foo(i);
+        printf("%i\n", foo(i));
     }
 
     for (int i = 0; i < 1000; ++i) {
-        std::cout << bar(0);
+        printf("%i\n", bar(0));
     }
 }

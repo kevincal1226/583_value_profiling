@@ -9,3 +9,4 @@ logs/
 *.profraw
 *_output
 env/
+*_value_profiled
