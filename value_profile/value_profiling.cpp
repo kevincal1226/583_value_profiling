@@ -54,9 +54,8 @@ using prof_map_t = std::unordered_map<std::string, std::unordered_map<std::strin
 
 namespace {
 
-auto parse_data() -> prof_map_t {
+auto parse_data(std::string&& filename) -> prof_map_t {
     prof_map_t prof_data;
-    std::string filename { "../../profile_stats.txt" };
     std::ifstream ifs { filename };
     std::string func_name;
     std::string var_name;
@@ -91,7 +90,7 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                  PB.registerPipelineParsingCallback(
                    [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
                        if (Name == "value_profiler") {
-                           FPM.addPass(ValueProfiler(parse_data()));
+                           FPM.addPass(ValueProfiler(parse_data("../../profile_stats.txt")));
                            return true;
                        }
                        return false;
