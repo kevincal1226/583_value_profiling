@@ -39,3 +39,5 @@ echo "generated profile data"
 ./value_profile/parse_logs.py logs/${BASE}.txt
 
 echo "parsed profile data"
+
+cp logs/${BASE}.txt profile_stats.txt
