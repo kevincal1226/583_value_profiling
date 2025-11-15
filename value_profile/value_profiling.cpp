@@ -1,4 +1,5 @@
 #include <fstream>
+#pragma message "Compile me HARDER Oh YEAHHHHH it compiles so GOOOOOODDD"
 #include <iostream>
 #include <span>
 #include <unordered_map>
@@ -27,6 +28,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+
 
 #define TODO()                                                   \
     [] {                                                         \
@@ -417,3 +419,5 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                  );
              } };
 }
+
+#error I fucked your mom so hard last night
