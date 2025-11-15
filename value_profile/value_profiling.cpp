@@ -1,22 +1,12 @@
-//===-- Frequent Path Loop Invariant Code Motion Pass --------------------===//
-//
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
-//
-//===---------------------------------------------------------------------===//
-//
-// CSE583 F25 - This pass can be used as a template for your FPLICM homework
-//               assignment.
-//               The passes get registered as "fplicm-correctness" and
-//               "fplicm-performance".
-//
-//
-////===-------------------------------------------------------------------===//
-
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include <llvm/Demangle/Demangle.h>
 #include <llvm/IR/BasicBlock.h>
@@ -41,20 +31,18 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 
-/* *******Implementation Starts Here******* */
-// You can include more Header files here
-/* *******Implementation Ends Here******* */
 using namespace llvm;
 
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <sstream>
+using value_frequency_pair_t = std::pair<int, double>;
+using prof_map_t = std::unordered_map<std::string, std::unordered_map<std::string, value_frequency_pair_t>>;
 
-using prof_map_t = std::unordered_map<std::string, std::unordered_map<std::string, std::unordered_map<int, double>>>;
 
 namespace {
+constexpr double HOT_FREQUENCY_THRESHOLD = 0.8;
 
+std::unordered_map<std::string, std::string> optimized_func_map {};
+
+// construct map of var name -> {value, highest_frequency}
 auto parse_data(std::string&& filename) -> prof_map_t {
     prof_map_t prof_data;
 
@@ -71,28 +59,154 @@ auto parse_data(std::string&& filename) -> prof_map_t {
         int value { std::stoi(value_str) };
         double probability { std::stod(probability_str) };
 
-        prof_data[func_name][var_name][value] = probability;
+        if (probability > prof_data[func_name][var_name].second) {
+            prof_data[func_name][var_name] = { value, probability };
+        }
     }
+
+    // erase non-hot vars
+    std::for_each(prof_data.begin(), prof_data.end(), [](auto& k) {
+        std::erase_if(k.second, [](auto& kv) { return kv.second.second < HOT_FREQUENCY_THRESHOLD; });
+    });
 
     return prof_data;
 }
 
 struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
     prof_map_t prof_map;
+    std::unordered_set<std::string> discovered {};
 
     ValueProfiler(prof_map_t&& prof_map)
         : prof_map(std::move(prof_map)) {}
 
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
-        std::string demanged_func_name = llvm::demangle(F.getName().str());
+    auto demangle_func_name(const std::string& s) -> std::string {
+        std::string demanged_func_name = llvm::demangle(s);
         std::string func_name = demanged_func_name.contains('(')
                                 ? demanged_func_name.erase(demanged_func_name.find_first_of('('))
                                 : demanged_func_name;
-        if (prof_map.contains(func_name)) {
-            errs() << "FUNCTION " << func_name << " EXISTS IN MAP\n";
-        } else {
-            errs() << "FUNCTION " << func_name << " DOES NOT EXIST IN MAP\n";
+
+        return func_name;
+    }
+
+    void wipe_uses(llvm::Function* F, const std::string& var_name, const int new_val) {
+        llvm::AllocaInst* yAddr = nullptr;
+
+        // 1. Find %y.addr (the alloca for argument y)
+        for (auto& BB : *F) {
+            for (auto& I : BB) {
+                if (auto* AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+                    if (AI->getName() == var_name + ".addr") {
+                        yAddr = AI;
+                        break;
+                    }
+                }
+            }
+            if (yAddr) break;
         }
+
+        if (!yAddr) return;   // not found
+
+        llvm::SmallVector<llvm::Instruction*, 8> toErase;
+
+        // 2. Iterate through all uses of y.addr
+        for (llvm::User* U : llvm::make_early_inc_range(yAddr->users())) {
+            if (auto* SI = llvm::dyn_cast<llvm::StoreInst>(U)) {
+                // store x -> y.addr  REMOVE IT
+                toErase.push_back(SI);
+            } else if (auto* LI = llvm::dyn_cast<llvm::LoadInst>(U)) {
+                // load from y.addr -> REPLACE WITH CONSTANT
+                llvm::IRBuilder<> builder(LI);
+                llvm::Value* constant = llvm::ConstantInt::get(LI->getType(), new_val);
+                LI->replaceAllUsesWith(constant);
+
+                toErase.push_back(LI);
+            } else {
+                llvm::errs() << "Unexpected *.addr user: " << *U << "\n";
+            }
+        }
+
+        // 3. Erase the loads + stores
+        for (auto* I : toErase) I->eraseFromParent();
+
+        // 4. Remove the alloca itself
+        if (yAddr->use_empty()) yAddr->eraseFromParent();
+    }
+
+
+    auto clone_func_if_hot(Function& F) -> Function* {
+        std::string func_name = demangle_func_name(F.getName().str());
+
+        // erase all params where the highest frequency < HOT_FREQUENCY_THRESHOLD
+
+        // if nothing to optimize, don't clone
+        if (prof_map[func_name].empty()) {
+            return nullptr;
+        }
+
+        // idk what any of this is
+        std::vector<Type*> params;
+        for (auto& arg : F.args()) {
+            if (!prof_map[func_name].contains(arg.getName().str())) {
+                params.push_back(arg.getType());
+            }
+        }
+
+        auto newFTy = FunctionType::get(F.getReturnType(), params, F.isVarArg());
+
+        // rename function to <name>_opt
+        Function* NewF = Function::Create(newFTy, F.getLinkage(), F.getName() + "_opt", F.getParent());
+
+        NewF->copyAttributesFrom(&F);
+        ValueToValueMapTy VMap;
+
+        // clone functions args???
+        auto NFArgIt = NewF->arg_begin();
+        for (const Argument& Arg : F.args()) {
+            if (!prof_map[func_name].contains(Arg.getName().str())) {
+                NFArgIt->setName(Arg.getName());
+                VMap[&Arg] = &*NFArgIt++;
+            } else {
+                // ????
+                VMap[&Arg] = ConstantInt::get(Type::getInt32Ty(F.getContext()), 0);
+            }
+        }
+
+        SmallVector<ReturnInst*, 8> Returns;
+        CloneFunctionInto(NewF, &F, VMap, CloneFunctionChangeType::DifferentModule, Returns);
+        // end of idk what any of this is
+
+
+        // wipe all uses of things we've profiled
+        for (const auto& [var_name, value_and_freq] : prof_map[func_name]) {
+            wipe_uses(NewF, var_name, value_and_freq.first);
+        }
+
+        return NewF;
+    }
+
+    auto try_clone_func(Function& F) -> Function* {
+        std::string mangled_func_name = F.getName().str();
+
+        if (mangled_func_name.contains("_opt") || !discovered.insert(mangled_func_name).second) {
+            return nullptr;
+        }
+
+        std::string func_name = demangle_func_name(mangled_func_name);
+
+        // if it's a function with arguments, clone it
+        if (prof_map.contains(func_name)) {
+            return clone_func_if_hot(F);
+        }
+
+        return nullptr;
+    }
+
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+        auto NewF = try_clone_func(F);
+        if (NewF == nullptr) {
+            return PreservedAnalyses::none();
+        }
+
         return PreservedAnalyses::none();
     }
 };
