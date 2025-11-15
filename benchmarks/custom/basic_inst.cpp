@@ -18,11 +18,17 @@ int bar(int y) {
 }
 
 int main() {
-    for (int i = 0; i < 1000; ++i) {
+    for (int i = 0; i < 10; ++i) {
         printf("%i\n", foo(i));
     }
 
-    for (int i = 0; i < 1000; ++i) {
-        printf("%i\n", bar(0));
+    for (int i = 0; i < 10; ++i) {
+        int x;
+        if (i < 8) {
+            x = bar(0);
+        } else {
+            x = bar(i);
+        }
+        printf("%i\n", x);
     }
 }
