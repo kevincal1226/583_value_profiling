@@ -1,4 +1,5 @@
 #include <fstream>
+#include <iostream>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -26,6 +27,12 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+
+#define TODO()                                                   \
+    [] {                                                         \
+        static_assert(false, "Plz daddy implement all over me"); \
+        return "";                                               \
+    }()
 
 using namespace llvm;
 
@@ -276,13 +283,15 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
 };
 
 struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
-    using func_name_t = std::string;
-
-    std::unordered_map<func_name_t, std::vector<value_frequency_pair_t>> data;
+    std::unordered_map<Instruction*, std::vector<Function*>> optimizable_indirect_calls;
     // prof_map_t prof_map;
 
     // IndirectCallOptimizer(prof_map_t&& prof_map)
     //     : prof_map(std::move(prof_map)) {}
+
+    auto parse_indirect_call_data(std::string_view file) { TODO(); }
+
+    IndirectCallOptimizer(std::string_view file) { parse_indirect_call_data(file); }
 
     auto replace_indirect_call_with(
       Function& func, BasicBlock& before_bb, CallInst* const call_instr, std::vector<Function*> const& functions
@@ -301,8 +310,11 @@ struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
           = call_instr->getType()->isVoidTy() ? nullptr : builder.CreatePHI(call_instr->getType(), functions.size());
 
         auto const indirect_call_target = call_instr->getCalledOperand();
-        auto const insert_actual_functions
-          = [&](this auto&& self, BasicBlock* const replace_bb, size_t function_i = 0) -> auto {
+
+        // all this basically does is generate an if ... else if ... else ... based on the
+        // number of functions to optimize
+        auto const substitute_functions
+          = [&](this auto&& self, BasicBlock* const replace_bb, size_t const function_i = 0) -> auto {
             auto const actual_function = functions[function_i];
 
             BasicBlock* const then_bb = BasicBlock::Create(context, "then_bb", &func, after_bb);
@@ -336,7 +348,6 @@ struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
             builder.Insert(new_call_instr);
             builder.CreateBr(after_bb);
 
-
             // create the branch for the next instruction
             if (function_i + 1 >= functions.size()) {
                 if (phi != nullptr) {
@@ -348,20 +359,16 @@ struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
             self(else_bb, function_i + 1);
         };
 
-        insert_actual_functions(&before_bb);
+        substitute_functions(&before_bb);
 
         if (phi != nullptr) {
             call_instr->replaceAllUsesWith(phi);
         }
+
         call_instr->eraseFromParent();
     }
 
     auto run(Function& F, FunctionAnalysisManager& FAM) -> PreservedAnalyses {
-        // auto& hi = F.getParent()->getFunctionList();
-        // for (auto& e : hi) {
-        //     errs() << e << '\n';
-        // }
-        auto f = F.getParent()->getFunction("_Z3bari");
         for (auto bb_it = F.begin(); bb_it != F.end();) {
             auto& bb = *bb_it++;
             for (auto instruction_it = bb.begin(); instruction_it != bb.end();) {
@@ -378,8 +385,11 @@ struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
                     continue;
                 }
 
-                replace_indirect_call_with(F, bb, call_instr, { f });
-                // TODO: checks and shit
+                if (!optimizable_indirect_calls.contains(call_instr)) {
+                    continue;
+                }
+
+                replace_indirect_call_with(F, bb, call_instr, optimizable_indirect_calls[call_instr]);
             }
         }
 
@@ -397,7 +407,7 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                  PB.registerPipelineParsingCallback(
                    [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
                        if (Name == "value_profiler") {
-                           FPM.addPass(IndirectCallOptimizer());
+                           FPM.addPass(IndirectCallOptimizer(TODO()));
                            FPM.addPass(ValueProfiler(parse_data("../../profile_stats.txt")));
                            return true;
                        }
