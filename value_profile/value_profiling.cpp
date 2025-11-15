@@ -31,14 +31,13 @@ using namespace llvm;
 using value_frequency_pair_t = std::pair<int, double>;
 using prof_map_t = std::unordered_map<std::string, std::unordered_map<std::string, value_frequency_pair_t>>;
 
-
 namespace {
 constexpr double HOT_FREQUENCY_THRESHOLD = 0.8;
 
 std::unordered_map<std::string, std::string> optimized_func_map {};
 
 // construct map of var name -> {value, highest_frequency}
-auto parse_data(std::string&& filename) -> prof_map_t {
+auto parse_data(std::string const& filename) -> prof_map_t {
     prof_map_t prof_data;
 
     std::ifstream ifs { filename };
@@ -49,10 +48,13 @@ auto parse_data(std::string&& filename) -> prof_map_t {
     std::string frequency_str;
     std::string probability_str;
 
-    while (std::getline(ifs, func_name, ','), std::getline(ifs, var_name, ','), std::getline(ifs, value_str, ','),
-           std::getline(ifs, frequency_str, ','), std::getline(ifs, probability_str)) {
-        int value { std::stoi(value_str) };
-        double probability { std::stod(probability_str) };
+    while (std::getline(ifs, func_name, ','),
+           std::getline(ifs, var_name, ','),
+           std::getline(ifs, value_str, ','),
+           std::getline(ifs, frequency_str, ','),
+           std::getline(ifs, probability_str)) {
+        int const value { std::stoi(value_str) };
+        double const probability { std::stod(probability_str) };
 
         if (probability > prof_data[func_name][var_name].second) {
             prof_data[func_name][var_name] = { value, probability };
@@ -68,7 +70,6 @@ auto parse_data(std::string&& filename) -> prof_map_t {
         return k.second.empty();
     });
 
-
     return prof_data;
 }
 
@@ -79,16 +80,16 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
         return prof_map.contains(demangle_func_name(called_function->getName().str()));
     }
 
-    std::unordered_set<std::string> discovered {};
+    std::unordered_set<std::string> discovered;
 
     ValueProfiler(prof_map_t&& prof_map)
         : prof_map(std::move(prof_map)) {}
 
-    auto demangle_func_name(const std::string& s) -> std::string {
+    auto demangle_func_name(std::string const& s) -> std::string {
         std::string demanged_func_name = llvm::demangle(s);
-        std::string func_name = demanged_func_name.contains('(')
-                                ? demanged_func_name.erase(demanged_func_name.find_first_of('('))
-                                : demanged_func_name;
+        std::string const func_name = demanged_func_name.contains('(')
+                                      ? demanged_func_name.erase(demanged_func_name.find_first_of('('))
+                                      : demanged_func_name;
 
         return func_name;
     }
@@ -111,7 +112,7 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
             }
         }
 
-        auto newFTy = FunctionType::get(F.getReturnType(), params, F.isVarArg());
+        auto const newFTy = FunctionType::get(F.getReturnType(), params, F.isVarArg());
 
         // rename function to <name>_opt
         Function* NewF = Function::Create(newFTy, F.getLinkage(), F.getName() + "_opt", F.getParent());
@@ -121,7 +122,7 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
 
         // clone functions args???
         auto NFArgIt = NewF->arg_begin();
-        for (const Argument& Arg : F.args()) {
+        for (Argument const& Arg : F.args()) {
             if (!prof_map[func_name].contains(Arg.getName().str())) {
                 NFArgIt->setName(Arg.getName());
                 ValueMap[&Arg] = &*NFArgIt++;
@@ -179,13 +180,14 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
 
         // some random boilerplate idk
         LLVMContext& Ctx = F.getContext();
-        Instruction* I = call_inst;
-        BasicBlock* OrigBB = I->getParent();
+        Instruction* const I = call_inst;
+        BasicBlock* const OrigBB = I->getParent();
 
         // Split at the call instruction
-        BasicBlock* AfterBB = OrigBB->splitBasicBlock(I, "after_call");
+        BasicBlock* const AfterBB = OrigBB->splitBasicBlock(I, "after_call");
 
-        // Remove the branch from the original split (it will be replaced by conditional branch)
+        // Remove the branch from the original split (it will be replaced by
+        // conditional branch)
         OrigBB->getTerminator()->eraseFromParent();
 
         // Create Then/Else blocks
@@ -285,6 +287,7 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                            return true;
                        }
                        return false;
-                   });
+                   }
+                 );
              } };
 }
