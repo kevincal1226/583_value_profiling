@@ -74,6 +74,11 @@ auto parse_data(std::string&& filename) -> prof_map_t {
 
 struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
     prof_map_t prof_map;
+
+    auto should_optimize_call(Function* const called_function) -> bool {
+        return prof_map.contains(demangle_func_name(called_function->getName().str()));
+    }
+
     std::unordered_set<std::string> discovered {};
 
     ValueProfiler(prof_map_t&& prof_map)
@@ -112,23 +117,23 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
         Function* NewF = Function::Create(newFTy, F.getLinkage(), F.getName() + "_opt", F.getParent());
 
         NewF->copyAttributesFrom(&F);
-        ValueToValueMapTy VMap;
+        ValueToValueMapTy ValueMap;
 
         // clone functions args???
         auto NFArgIt = NewF->arg_begin();
         for (const Argument& Arg : F.args()) {
             if (!prof_map[func_name].contains(Arg.getName().str())) {
                 NFArgIt->setName(Arg.getName());
-                VMap[&Arg] = &*NFArgIt++;
+                ValueMap[&Arg] = &*NFArgIt++;
             } else {
                 // replace arg with a constant
-                VMap[&Arg]
+                ValueMap[&Arg]
                   = ConstantInt::get(Type::getInt32Ty(F.getContext()), prof_map[func_name][Arg.getName().str()].first);
             }
         }
 
         SmallVector<ReturnInst*, 8> Returns;
-        CloneFunctionInto(NewF, &F, VMap, CloneFunctionChangeType::DifferentModule, Returns);
+        CloneFunctionInto(NewF, &F, ValueMap, CloneFunctionChangeType::DifferentModule, Returns);
         // end of idk what any of this is
     }
 
@@ -151,9 +156,7 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
         Function* called_func = call_inst->getCalledFunction();
 
         // indirect calls i.e. fun ptrs
-        if (!called_func) {
-            return;
-        }
+        assert(called_func != nullptr);
 
         std::string called_func_name = called_func->getName().str();
         std::string demangled_called_func_name = demangle_func_name(called_func_name);
@@ -229,25 +232,32 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
     }
 
     auto optimize_calls(Function& F) {
-        std::vector<llvm::CallInst*> to_opt;
+        std::vector<llvm::CallInst*> func_calls_to_opt;
 
-        for (auto& BB : F) {
-            for (auto& I : BB) {
-                auto* call_inst = llvm::dyn_cast<llvm::CallInst>(&I);
+        for (auto& basic_block : F) {
+            for (auto& instruction : basic_block) {
+                auto* call_inst = llvm::dyn_cast<llvm::CallInst>(&instruction);
 
                 if (call_inst == nullptr) {
                     continue;
                 }
 
-                if (!prof_map.contains(demangle_func_name(call_inst->getCalledFunction()->getName().str()))) {
+                auto const called_function = call_inst->getCalledFunction();
+
+                // called function might be indirect
+                if (called_function == nullptr) {
                     continue;
                 }
 
-                to_opt.push_back(call_inst);
+                if (!should_optimize_call(called_function)) {
+                    continue;
+                }
+
+                func_calls_to_opt.push_back(call_inst);
             }
         }
 
-        for (auto& inst : to_opt) {
+        for (auto const& inst : func_calls_to_opt) {
             insert_phi(inst, F);
         }
     }
