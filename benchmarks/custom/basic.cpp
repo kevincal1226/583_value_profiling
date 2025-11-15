@@ -4,6 +4,7 @@ int foo(int x) {
     return x + 8;
 }
 int bar(int y) {
+    y = 10;
     return y * 1000;
 }
 

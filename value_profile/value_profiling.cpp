@@ -88,51 +88,6 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
         return func_name;
     }
 
-    void wipe_uses(llvm::Function* F, const std::string& var_name, const int new_val) {
-        llvm::AllocaInst* yAddr = nullptr;
-
-        // 1. Find %y.addr (the alloca for argument y)
-        for (auto& BB : *F) {
-            for (auto& I : BB) {
-                if (auto* AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
-                    if (AI->getName() == var_name + ".addr") {
-                        yAddr = AI;
-                        break;
-                    }
-                }
-            }
-            if (yAddr) break;
-        }
-
-        if (!yAddr) return;   // not found
-
-        llvm::SmallVector<llvm::Instruction*, 8> toErase;
-
-        // 2. Iterate through all uses of y.addr
-        for (llvm::User* U : llvm::make_early_inc_range(yAddr->users())) {
-            if (auto* SI = llvm::dyn_cast<llvm::StoreInst>(U)) {
-                // store x -> y.addr  REMOVE IT
-                toErase.push_back(SI);
-            } else if (auto* LI = llvm::dyn_cast<llvm::LoadInst>(U)) {
-                // load from y.addr -> REPLACE WITH CONSTANT
-                llvm::IRBuilder<> builder(LI);
-                llvm::Value* constant = llvm::ConstantInt::get(LI->getType(), new_val);
-                LI->replaceAllUsesWith(constant);
-
-                toErase.push_back(LI);
-            } else {
-                llvm::errs() << "Unexpected *.addr user: " << *U << "\n";
-            }
-        }
-
-        // 3. Erase the loads + stores
-        for (auto* I : toErase) I->eraseFromParent();
-
-        // 4. Remove the alloca itself
-        if (yAddr->use_empty()) yAddr->eraseFromParent();
-    }
-
-
     auto clone_func_if_hot(Function& F) -> Function* {
         std::string func_name = demangle_func_name(F.getName().str());
 
@@ -166,8 +121,9 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
                 NFArgIt->setName(Arg.getName());
                 VMap[&Arg] = &*NFArgIt++;
             } else {
-                // ????
-                VMap[&Arg] = ConstantInt::get(Type::getInt32Ty(F.getContext()), 0);
+                // replace arg with a constant
+                VMap[&Arg]
+                  = ConstantInt::get(Type::getInt32Ty(F.getContext()), prof_map[func_name][Arg.getName().str()].first);
             }
         }
 
@@ -175,11 +131,6 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
         CloneFunctionInto(NewF, &F, VMap, CloneFunctionChangeType::DifferentModule, Returns);
         // end of idk what any of this is
 
-
-        // wipe all uses of things we've profiled
-        for (const auto& [var_name, value_and_freq] : prof_map[func_name]) {
-            wipe_uses(NewF, var_name, value_and_freq.first);
-        }
 
         return NewF;
     }
