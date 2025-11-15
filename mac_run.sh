@@ -9,7 +9,7 @@ LIB="build/value_profile/ValueProfilingPass.dylib"
 
 mkdir -p build
 cd build
-cmake ..
+cmake -D CMAKE_C_CMPILER=/usr/bin/clang -D CMAKE_CXX_COMPILER=/usr/bin/clang++ ..
 make
 cd ..
 
