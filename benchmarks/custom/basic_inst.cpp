@@ -4,7 +4,7 @@
 std::ofstream g_log_file("logs/basic.cpp.txt");
 std::unordered_map<std::string, size_t> g_param_freq;
 
-#include <stdio.h>
+#include <cstdio>
 
 int foo(int x) {
     g_log_file << "foo" << " " << "x=" << x << std::endl;

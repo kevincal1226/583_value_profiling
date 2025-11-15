@@ -1,4 +1,5 @@
 #include <fstream>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -73,6 +74,15 @@ auto parse_data(std::string const& filename) -> prof_map_t {
     return prof_data;
 }
 
+auto demangle_func_name(std::string const& s) -> std::string {
+    std::string demanged_func_name = llvm::demangle(s);
+    std::string const func_name = demanged_func_name.contains('(')
+                                  ? demanged_func_name.erase(demanged_func_name.find_first_of('('))
+                                  : demanged_func_name;
+
+    return func_name;
+}
+
 struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
     prof_map_t prof_map;
 
@@ -85,14 +95,6 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
     ValueProfiler(prof_map_t&& prof_map)
         : prof_map(std::move(prof_map)) {}
 
-    auto demangle_func_name(std::string const& s) -> std::string {
-        std::string demanged_func_name = llvm::demangle(s);
-        std::string const func_name = demanged_func_name.contains('(')
-                                      ? demanged_func_name.erase(demanged_func_name.find_first_of('('))
-                                      : demanged_func_name;
-
-        return func_name;
-    }
 
     auto clone_func_if_hot(Function& F) {
         std::string func_name = demangle_func_name(F.getName().str());
@@ -273,6 +275,118 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
     }
 };
 
+struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
+    using func_name_t = std::string;
+
+    std::unordered_map<func_name_t, std::vector<value_frequency_pair_t>> data;
+    // prof_map_t prof_map;
+
+    // IndirectCallOptimizer(prof_map_t&& prof_map)
+    //     : prof_map(std::move(prof_map)) {}
+
+    auto replace_indirect_call_with(
+      Function& func, BasicBlock& before_bb, CallInst* const call_instr, std::vector<Function*> const& functions
+    ) {
+        if (functions.empty()) {
+            return;
+        }
+
+        BasicBlock* const after_bb = before_bb.splitBasicBlock(call_instr, "after_call");
+
+        auto& context = before_bb.getContext();
+
+        IRBuilder<> builder { after_bb, after_bb->begin() };
+
+        PHINode* const phi
+          = call_instr->getType()->isVoidTy() ? nullptr : builder.CreatePHI(call_instr->getType(), functions.size());
+
+        auto const indirect_call_target = call_instr->getCalledOperand();
+        auto const insert_actual_functions
+          = [&](this auto&& self, BasicBlock* const replace_bb, size_t function_i = 0) -> auto {
+            auto const actual_function = functions[function_i];
+
+            BasicBlock* const then_bb = BasicBlock::Create(context, "then_bb", &func, after_bb);
+            BasicBlock* const else_bb = BasicBlock::Create(context, "else_bb", &func, after_bb);
+
+            replace_bb->getTerminator()->eraseFromParent();
+
+
+            // create the function pointer check
+            builder.SetInsertPoint(replace_bb);
+            auto const cmp = builder.CreateICmpEQ(indirect_call_target, actual_function);
+            builder.CreateCondBr(cmp, then_bb, else_bb);
+
+
+            // create and insert the fixed call instruction
+            auto const fixed_call_instr = dyn_cast<CallInst>(call_instr->clone());
+            fixed_call_instr->setCalledFunction(actual_function);
+
+            builder.SetInsertPoint(then_bb);
+            builder.Insert(fixed_call_instr);
+            builder.CreateBr(after_bb);
+
+            if (phi != nullptr) {
+                phi->addIncoming(fixed_call_instr, then_bb);
+            }
+
+            // create the else block
+            auto const new_call_instr = call_instr->clone();
+
+            builder.SetInsertPoint(else_bb);
+            builder.Insert(new_call_instr);
+            builder.CreateBr(after_bb);
+
+
+            // create the branch for the next instruction
+            if (function_i + 1 >= functions.size()) {
+                if (phi != nullptr) {
+                    phi->addIncoming(new_call_instr, else_bb);
+                }
+
+                return;
+            }
+            self(else_bb, function_i + 1);
+        };
+
+        insert_actual_functions(&before_bb);
+
+        if (phi != nullptr) {
+            call_instr->replaceAllUsesWith(phi);
+        }
+        call_instr->eraseFromParent();
+    }
+
+    auto run(Function& F, FunctionAnalysisManager& FAM) -> PreservedAnalyses {
+        // auto& hi = F.getParent()->getFunctionList();
+        // for (auto& e : hi) {
+        //     errs() << e << '\n';
+        // }
+        auto f = F.getParent()->getFunction("_Z3bari");
+        for (auto bb_it = F.begin(); bb_it != F.end();) {
+            auto& bb = *bb_it++;
+            for (auto instruction_it = bb.begin(); instruction_it != bb.end();) {
+                auto& instruction = *instruction_it++;
+
+                auto const call_instr = dyn_cast<CallInst>(&instruction);
+
+                if (call_instr == nullptr) {
+                    continue;
+                }
+
+                auto const is_indirect_call = call_instr->getCalledFunction() == nullptr;
+                if (!is_indirect_call) {
+                    continue;
+                }
+
+                replace_indirect_call_with(F, bb, call_instr, { f });
+                // TODO: checks and shit
+            }
+        }
+
+        return PreservedAnalyses::none();
+    }
+};
+
 }   // namespace
 
 extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPluginLibraryInfo {
@@ -283,9 +397,11 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                  PB.registerPipelineParsingCallback(
                    [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
                        if (Name == "value_profiler") {
+                           FPM.addPass(IndirectCallOptimizer());
                            FPM.addPass(ValueProfiler(parse_data("../../profile_stats.txt")));
                            return true;
                        }
+
                        return false;
                    }
                  );
