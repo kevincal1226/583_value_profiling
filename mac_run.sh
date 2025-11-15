@@ -13,6 +13,8 @@ cmake ..
 make
 cd ..
 
+./value_profile/run_profiler $1
+
 if [ ! -f "$LIB" ]; then
     echo "Could not find $LIB. Please build your pass or correct the path in the script."
     exit 1
