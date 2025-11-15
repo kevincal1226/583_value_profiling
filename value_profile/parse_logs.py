@@ -27,7 +27,7 @@ for line in lines:
     func, _, vars = line.partition(" ")
     call_cnt[func] += 1
 
-    for v in vars.split(" "):
+    for v in vars.split(","):
         varname, var = v.split("=")
         var = int(var)
 

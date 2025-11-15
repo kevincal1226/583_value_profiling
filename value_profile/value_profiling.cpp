@@ -152,8 +152,8 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
         }
     }
 
-    auto insert_phi(CallInst* callInst, Function& F) {
-        Function* called_func = callInst->getCalledFunction();
+    auto insert_phi(CallInst* call_inst, Function& F) {
+        Function* called_func = call_inst->getCalledFunction();
 
         // indirect calls i.e. fun ptrs
         if (!called_func) {
@@ -161,29 +161,27 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
         }
 
         std::string called_func_name = called_func->getName().str();
-
         std::string demangled_called_func_name = demangle_func_name(called_func_name);
-
-
         std::string opt_func_name = called_func_name + "_opt";
 
-        Value* profiled_param = nullptr;
-
-        int comp_val {};
+        std::vector<std::pair<Value*, int>> hot_values;
+        std::vector<Value*> cold_values;
 
         int i = 0;
         for (auto& arg : called_func->args()) {
+            Value* val = call_inst->getArgOperand(i);
+
             if (prof_map[demangled_called_func_name].contains(arg.getName().str())) {
-                profiled_param = callInst->getArgOperand(i);
-                comp_val = prof_map[demangled_called_func_name][arg.getName().str()].first;
+                hot_values.emplace_back(val, prof_map[demangled_called_func_name][arg.getName().str()].first);
+            } else {
+                cold_values.push_back(val);
             }
             ++i;
         }
 
-        profiled_param->print(errs());
-
+        // some random boilerplate idk
         LLVMContext& Ctx = F.getContext();
-        Instruction* I = callInst;
+        Instruction* I = call_inst;
         BasicBlock* OrigBB = I->getParent();
 
         // Split at the call instruction
@@ -196,21 +194,32 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
         BasicBlock* ThenBB = BasicBlock::Create(Ctx, "then", &F, AfterBB);
         BasicBlock* ElseBB = BasicBlock::Create(Ctx, "else", &F, AfterBB);
 
-        // Conditional branch in OrigBB
         IRBuilder<> B(OrigBB);
-        Value* cmp = B.CreateICmpEQ(profiled_param, ConstantInt::get(profiled_param->getType(), comp_val));
+
+        // conditional branch with multiple conds
+        Value* cmp = nullptr;
+        for (auto& [val, comp_val] : hot_values) {
+            Value* tmp_cmp = B.CreateICmpEQ(val, ConstantInt::get(val->getType(), comp_val));
+            if (cmp == nullptr) {
+                cmp = tmp_cmp;
+            } else {
+                cmp = B.CreateAnd(cmp, tmp_cmp);
+            }
+        }
+
         B.CreateCondBr(cmp, ThenBB, ElseBB);
 
         // Fill Then block
         B.SetInsertPoint(ThenBB);
         Function* optF = F.getParent()->getFunction(opt_func_name);
-        Value* tmp1 = B.CreateCall(optF);
+        Value* tmp1 = B.CreateCall(optF, cold_values);
         B.CreateBr(AfterBB);   // terminator
 
         // Fill Else block
         B.SetInsertPoint(ElseBB);
-        Function* origF = F.getParent()->getFunction(called_func_name);
-        Value* tmp2 = B.CreateCall(origF, profiled_param);
+        // use the original call instruction in the else branch
+        Value* tmp2 = call_inst->clone();
+        B.Insert(tmp2);
         B.CreateBr(AfterBB);   // terminator
 
         // Insert PHI in AfterBB
@@ -220,8 +229,8 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
         phi->addIncoming(tmp2, ElseBB);
 
         // Replace uses of original call
-        callInst->replaceAllUsesWith(phi);
-        callInst->eraseFromParent();
+        call_inst->replaceAllUsesWith(phi);
+        call_inst->eraseFromParent();
     }
 
     auto optimize_calls(Function& F) {
@@ -229,18 +238,17 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
 
         for (auto& BB : F) {
             for (auto& I : BB) {
-                auto* callInst = llvm::dyn_cast<llvm::CallInst>(&I);
+                auto* call_inst = llvm::dyn_cast<llvm::CallInst>(&I);
 
-                if (callInst == nullptr) {
+                if (call_inst == nullptr) {
                     continue;
                 }
 
-                if (!prof_map.contains(demangle_func_name(callInst->getCalledFunction()->getName().str()))) {
+                if (!prof_map.contains(demangle_func_name(call_inst->getCalledFunction()->getName().str()))) {
                     continue;
                 }
 
-
-                to_opt.push_back(callInst);
+                to_opt.push_back(call_inst);
             }
         }
 
