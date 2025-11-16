@@ -3,11 +3,12 @@
 #include <stdio.h>
 
 void hi() {
-    printf("memes");
+    // printf("memes");
 }
 
 void foo(int (*x)(int)) {
-    printf("%d", x(3));
+    x(3);
+    // printf("%d", x(3));
 }
 
 int bar(int y) {
@@ -15,7 +16,7 @@ int bar(int y) {
 }
 
 int barf(int y) {
-    printf("barf");
+    // printf("barf");
     return y * 500;
 }
 
@@ -25,5 +26,5 @@ int main() {
 
     foo(barf);
 
-    return x(3);
+    return 0;
 }

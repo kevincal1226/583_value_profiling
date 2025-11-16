@@ -25,7 +25,7 @@ PATH2LIB=$(realpath "$LIB")
 CURRENT_DIR=$(pwd)
 
 # Default to correctness pass
-SELECTED_PASS=value_profiler
+SELECTED_PASS=value_indirect_call
 flag_set=false
 generate_viz=false
 
@@ -127,6 +127,13 @@ opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.bc
 ##############################################
 #            RUN YOUR PASS
 ##############################################
+
+# run the value profiler thing
+opt -S -load-pass-plugin="${PATH2LIB}" -passes="value_profiler" ${FILENAME}.bc -o ${FILENAME}.profiler.bc >/dev/null
+
+clang -fprofile-instr-generate ${FILENAME}.profiler.bc -o ${FILENAME}_profiler
+
+./${FILENAME}_profiler
 
 # We now use the profile augmented bc file as input to your pass.
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_profiled.bc >/dev/null

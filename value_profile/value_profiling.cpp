@@ -1,5 +1,5 @@
 #include <fstream>
-#pragma message "Compile me HARDER Oh YEAHHHHH it compiles so GOOOOOODDD"
+// #pragma message "Compile me HARDER Oh YEAHHHHH it compiles so GOOOOOODDD"
 #include <iostream>
 #include <span>
 #include <unordered_map>
@@ -30,12 +30,6 @@
 #include "llvm/Transforms/Utils/LoopUtils.h"
 
 
-#define TODO()                                                   \
-    [] {                                                         \
-        static_assert(false, "Plz daddy implement all over me"); \
-        return "";                                               \
-    }()
-
 using namespace llvm;
 
 using value_frequency_pair_t = std::pair<int, double>;
@@ -58,11 +52,8 @@ auto parse_data(std::string const& filename) -> prof_map_t {
     std::string frequency_str;
     std::string probability_str;
 
-    while (std::getline(ifs, func_name, ','),
-           std::getline(ifs, var_name, ','),
-           std::getline(ifs, value_str, ','),
-           std::getline(ifs, frequency_str, ','),
-           std::getline(ifs, probability_str)) {
+    while (std::getline(ifs, func_name, ','), std::getline(ifs, var_name, ','), std::getline(ifs, value_str, ','),
+           std::getline(ifs, frequency_str, ','), std::getline(ifs, probability_str)) {
         int const value { std::stoi(value_str) };
         double const probability { std::stod(probability_str) };
 
@@ -92,7 +83,8 @@ auto demangle_func_name(std::string const& s) -> std::string {
     return func_name;
 }
 
-struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
+
+struct SpecializeFunctions : public PassInfoMixin<SpecializeFunctions> {
     prof_map_t prof_map;
 
     auto should_optimize_call(Function* const called_function) -> bool {
@@ -101,7 +93,7 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
 
     std::unordered_set<std::string> discovered;
 
-    ValueProfiler(prof_map_t&& prof_map)
+    SpecializeFunctions(prof_map_t&& prof_map)
         : prof_map(std::move(prof_map)) {}
 
 
@@ -285,19 +277,19 @@ struct ValueProfiler : public PassInfoMixin<ValueProfiler> {
 };
 
 struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
-    std::unordered_map<Instruction*, std::vector<Function*>> optimizable_indirect_calls;
+    using instruction_name_t = std::string;
+    std::unordered_map<instruction_name_t, std::vector<Function*>> optimizable_indirect_calls;
     // prof_map_t prof_map;
 
     // IndirectCallOptimizer(prof_map_t&& prof_map)
     //     : prof_map(std::move(prof_map)) {}
 
-    auto parse_indirect_call_data(std::string_view file) { TODO(); }
+    auto parse_indirect_call_data(std::string_view file) {}
 
     IndirectCallOptimizer(std::string_view file) { parse_indirect_call_data(file); }
 
-    auto replace_indirect_call_with(
-      Function& func, BasicBlock& before_bb, CallInst* const call_instr, std::vector<Function*> const& functions
-    ) {
+    auto replace_indirect_call_with(Function& func, BasicBlock& before_bb, CallInst* const call_instr,
+                                    std::vector<Function*> const& functions) {
         if (functions.empty()) {
             return;
         }
@@ -387,11 +379,90 @@ struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
                     continue;
                 }
 
-                if (!optimizable_indirect_calls.contains(call_instr)) {
-                    continue;
-                }
+                // TODO: user profile data
+                assert(false);
+                // if (!optimizable_indirect_calls.contains(call_instr)) {
+                //     continue;
+                // }
 
-                replace_indirect_call_with(F, bb, call_instr, optimizable_indirect_calls[call_instr]);
+                // replace_indirect_call_with(F, bb, call_instr, optimizable_indirect_calls[call_instr]);
+            }
+        }
+
+        return PreservedAnalyses::none();
+    }
+};
+
+// TODO: make it so the prints go to an actual file
+struct ValueProfiler : PassInfoMixin<ValueProfiler> {
+    uint32_t instruction_uid { 0 };
+
+    static auto get_or_insert_printf_func(llvm::Module& M) -> llvm::FunctionCallee {
+        llvm::LLVMContext& ctx = M.getContext();
+
+        llvm::FunctionType* printf_type
+          = llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx), { PointerType::get(ctx, 0) }, true);
+
+        return M.getOrInsertFunction("printf", printf_type);
+    }
+
+    static auto make_fmt(Module& module, LLVMContext& context, std::string const& str) -> GlobalVariable* {
+        Constant* const fmt_data = ConstantDataArray::getString(context, str, true);
+        auto* const fmt
+          = new GlobalVariable(module, fmt_data->getType(), true, GlobalValue::PrivateLinkage, fmt_data, ".fmt");
+
+        return fmt;
+    }
+
+    /*
+     * Basically just inserts a thing to print this function's name and a pointer to it at the start of the main
+     * function
+     */
+    static auto insert_ptr_to_func_mapping(Function& F, Module& module, LLVMContext& context, BasicBlock& insert_point)
+      -> void {
+        // build the formatting string
+        auto* const fmt = make_fmt(module, context, "FMAP %p -> " + F.getNameOrAsOperand() + "\n");
+
+        IRBuilder<> builder(&insert_point, insert_point.begin());
+
+        // get pointers to the fmt string and function
+        Value* const fmt_ptr = builder.CreateBitCast(fmt, PointerType::get(context, 0));
+        Value* const func_ptr = builder.CreateBitCast(&F, PointerType::get(context, 0));
+
+        // insert the actual call
+        builder.CreateCall(get_or_insert_printf_func(module), { fmt_ptr, func_ptr });
+    }
+
+    static auto print_indirect_call(Module& module, LLVMContext& context, CallInst* call_inst) {
+        IRBuilder<> builder { call_inst };
+
+        // get the variables name and create the fmt string for it
+        std::string const name = "%" + call_inst->getCalledOperand()->getNameOrAsOperand();
+        GlobalVariable* const fmt = make_fmt(module, context, "ICALL " + name + " %p\n");
+
+        // get pointers to the fmt string and function
+        Value* const fmt_ptr = builder.CreateBitCast(fmt, PointerType::get(context, 0));
+        Value* const indirect_target = call_inst->getCalledOperand();
+
+        // insert the actual call
+        builder.CreateCall(get_or_insert_printf_func(module), { fmt_ptr, indirect_target });
+    }
+
+    auto run(Function& F, FunctionAnalysisManager& FAM) -> PreservedAnalyses {
+        Module* const module = F.getParent();
+        LLVMContext& context = module->getContext();
+        BasicBlock& main_func_bb = *module->getFunction("main")->begin();
+
+        insert_ptr_to_func_mapping(F, *module, context, main_func_bb);
+
+        for (auto& bb : F) {
+            for (auto& instr : bb) {
+                // profile indirect function call
+                auto* const call_inst = dyn_cast<CallInst>(&instr);
+                auto const is_indirect_call = call_inst != nullptr && call_inst->getCalledFunction() == nullptr;
+                if (is_indirect_call) {
+                    print_indirect_call(*module, context, call_inst);
+                }
             }
         }
 
@@ -409,15 +480,24 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                  PB.registerPipelineParsingCallback(
                    [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
                        if (Name == "value_profiler") {
-                           FPM.addPass(IndirectCallOptimizer(TODO()));
-                           FPM.addPass(ValueProfiler(parse_data("../../profile_stats.txt")));
+                           FPM.addPass(ValueProfiler());
+                           return true;
+                       }
+
+                       // TODO: incomplete pass
+                       // if (Name == "value_indirect_call") {
+                       //     FPM.addPass(IndirectCallOptimizer(""));
+                       //     return true;
+                       // }
+
+                       if (Name == "value_specialize") {
+                           FPM.addPass(SpecializeFunctions(parse_data("../../profile_stats.txt")));
                            return true;
                        }
 
                        return false;
-                   }
-                 );
+                   });
              } };
 }
 
-#error I fucked your mom so hard last night
+// #error I fucked your mom so hard last night
