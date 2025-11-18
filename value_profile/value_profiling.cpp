@@ -1,6 +1,7 @@
 #include <fstream>
 // #pragma message "Compile me HARDER Oh YEAHHHHH it compiles so GOOOOOODDD"
 #include <iostream>
+#include <iterator>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -395,15 +396,19 @@ struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
 
 // TODO: make it so the prints go to an actual file
 struct ValueProfiler : PassInfoMixin<ValueProfiler> {
-    uint32_t instruction_uid { 0 };
+    GlobalValue* global_fileptr {};
+    std::string log_directory;
 
-    static auto get_or_insert_printf_func(llvm::Module& M) -> llvm::FunctionCallee {
-        llvm::LLVMContext& ctx = M.getContext();
+    ValueProfiler(std::string log_directory)
+        : log_directory(std::move(log_directory)) {}
 
-        llvm::FunctionType* printf_type
-          = llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx), { PointerType::get(ctx, 0) }, true);
+    static auto get_or_insert_fprintf_func(llvm::Module& M) -> llvm::FunctionCallee {
+        LLVMContext& ctx = M.getContext();
 
-        return M.getOrInsertFunction("printf", printf_type);
+        FunctionType* fprintf_type = FunctionType::get(llvm::Type::getInt32Ty(ctx),
+                                                       { PointerType::get(ctx, 0), PointerType::get(ctx, 0) }, true);
+
+        return M.getOrInsertFunction("fprintf", fprintf_type);
     }
 
     static auto make_fmt(Module& module, LLVMContext& context, std::string const& str) -> GlobalVariable* {
@@ -418,22 +423,23 @@ struct ValueProfiler : PassInfoMixin<ValueProfiler> {
      * Basically just inserts a thing to print this function's name and a pointer to it at the start of the main
      * function
      */
-    static auto insert_ptr_to_func_mapping(Function& F, Module& module, LLVMContext& context, BasicBlock& insert_point)
-      -> void {
+    auto insert_ptr_to_func_mapping(Function& F, Module& module, LLVMContext& context, BasicBlock& insert_into_bb,
+                                    BasicBlock::iterator const& insert_instr_at) -> void {
         // build the formatting string
         auto* const fmt = make_fmt(module, context, "FMAP %p -> " + F.getNameOrAsOperand() + "\n");
 
-        IRBuilder<> builder(&insert_point, insert_point.begin());
+        IRBuilder<> builder(&insert_into_bb, insert_instr_at);
 
         // get pointers to the fmt string and function
         Value* const fmt_ptr = builder.CreateBitCast(fmt, PointerType::get(context, 0));
         Value* const func_ptr = builder.CreateBitCast(&F, PointerType::get(context, 0));
 
         // insert the actual call
-        builder.CreateCall(get_or_insert_printf_func(module), { fmt_ptr, func_ptr });
+        Value* file_ptr = builder.CreateLoad(builder.getPtrTy(), global_fileptr);
+        builder.CreateCall(get_or_insert_fprintf_func(module), { file_ptr, fmt_ptr, func_ptr });
     }
 
-    static auto print_indirect_call(Module& module, LLVMContext& context, CallInst* call_inst) {
+    auto print_indirect_call(Module& module, LLVMContext& context, CallInst* call_inst) {
         IRBuilder<> builder { call_inst };
 
         // get the variables name and create the fmt string for it
@@ -445,7 +451,29 @@ struct ValueProfiler : PassInfoMixin<ValueProfiler> {
         Value* const indirect_target = call_inst->getCalledOperand();
 
         // insert the actual call
-        builder.CreateCall(get_or_insert_printf_func(module), { fmt_ptr, indirect_target });
+        Value* file_ptr = builder.CreateLoad(builder.getPtrTy(), global_fileptr);
+        builder.CreateCall(get_or_insert_fprintf_func(module), { file_ptr, fmt_ptr, indirect_target });
+    }
+
+    auto insert_fopen(Module& module, LLVMContext& context, IRBuilder<>& builder, std::string const& filename) -> void {
+        // create a global pointer for the output file
+        global_fileptr
+          = new GlobalVariable(module, PointerType::get(context, 0), false, GlobalValue::ExternalLinkage,
+                               llvm::ConstantPointerNull::get(PointerType::get(context, 0)), "global_file_ptr");
+
+        PointerType* const ptr_ty = PointerType::get(context, 0);
+        FunctionType* const fopen_type = FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
+        FunctionCallee const fopen_func = module.getOrInsertFunction("fopen", fopen_type);
+
+        // Format string literals
+        auto* const filename_str = builder.CreateGlobalString(filename);
+        auto* const mode_str = builder.CreateGlobalString("w");
+
+        // Call fopen
+        Value* const file_ptr_value = builder.CreateCall(fopen_func, { filename_str, mode_str });
+
+        // save it in global variable
+        builder.CreateStore(file_ptr_value, global_fileptr);
     }
 
     auto run(Function& F, FunctionAnalysisManager& FAM) -> PreservedAnalyses {
@@ -453,7 +481,16 @@ struct ValueProfiler : PassInfoMixin<ValueProfiler> {
         LLVMContext& context = module->getContext();
         BasicBlock& main_func_bb = *module->getFunction("main")->begin();
 
-        insert_ptr_to_func_mapping(F, *module, context, main_func_bb);
+        // Insert a call to fopen at the very start of main
+        if (global_fileptr == nullptr) {
+            IRBuilder<> builder(&main_func_bb, main_func_bb.begin());
+            insert_fopen(*module, context, builder, log_directory);
+        }
+
+        // We need to insert everything else after the fopen
+        auto main_insert_pos = main_func_bb.begin();
+        std::advance(main_insert_pos, 2);
+        insert_ptr_to_func_mapping(F, *module, context, main_func_bb, main_insert_pos);
 
         for (auto& bb : F) {
             for (auto& instr : bb) {
@@ -480,7 +517,7 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                  PB.registerPipelineParsingCallback(
                    [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
                        if (Name == "value_profiler") {
-                           FPM.addPass(ValueProfiler());
+                           FPM.addPass(ValueProfiler("../../logs/value_pass_information.txt"));
                            return true;
                        }
 
