@@ -134,7 +134,7 @@ opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc
 ##############################################
 #     RUN O2 OPTIMIZATIONS AFTER YOUR PASS
 ##############################################
-opt -passes='default<O2>' ${FILENAME}.value_profiled.bc -o ${FILENAME}.value_profiled.O2.bc
+opt -S -passes='default<O2>' ${FILENAME}.value_profiled.bc -o ${FILENAME}.value_profiled.O2.bc
 
 # Generate binary excutable before FPLICM: Unoptimzed code
 clang -fprofile-instr-generate ${FILENAME}.bc -o ${FILENAME}_not_value_profiled
