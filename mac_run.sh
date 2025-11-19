@@ -136,6 +136,11 @@ opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc
 ##############################################
 opt -S -passes='default<O2>' ${FILENAME}.value_profiled.bc -o ${FILENAME}.value_profiled.O2.bc
 
+##############################################
+#     RUN O2 OPTIMIZATIONS WITHOUT PASS
+##############################################
+opt -S -passes='default<O2>' ${FILENAME}.bc -o ${FILENAME}.not_value_profiled.O2.bc
+
 # Generate binary excutable before FPLICM: Unoptimzed code
 clang -fprofile-instr-generate ${FILENAME}.bc -o ${FILENAME}_not_value_profiled
 # Generate binary executable after FPLICM: Optimized code
@@ -143,8 +148,6 @@ clang -fprofile-instr-generate ${FILENAME}.value_profiled.bc -o ${FILENAME}_valu
 
 # Binary AFTER your pass + O2
 clang -fprofile-instr-generate ${FILENAME}.value_profiled.O2.bc -o ${FILENAME}_value_profiled_O2
-
-rm ${FILENAME}.bc
 
 generate_cfg_viz() {
     VIZ_TYPE=cfg
