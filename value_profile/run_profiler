@@ -30,7 +30,7 @@ echo "binary:    build/${NAME}"
 # run program and collect values
 g++ -std=c++23 -g "$OUT"
 
-./a.out >/dev/null
+timeout 5 ./a.out >/dev/null || true
 
 rm a.out
 
