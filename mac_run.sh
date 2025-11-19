@@ -124,13 +124,25 @@ clang -emit-llvm -fno-discard-value-names -c ${FILENAME}.cpp -Xclang -disable-O0
 # Canonicalize natural loops (Ref: llvm.org/doxygen/LoopSimplify_8h_source.html)
 opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.bc
 
+##############################################
+#            RUN YOUR PASS
+##############################################
+
 # We now use the profile augmented bc file as input to your pass.
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_profiled.bc >/dev/null
+
+##############################################
+#     RUN O2 OPTIMIZATIONS AFTER YOUR PASS
+##############################################
+opt -passes='default<O2>' ${FILENAME}.value_profiled.bc -o ${FILENAME}.value_profiled.O2.bc
 
 # Generate binary excutable before FPLICM: Unoptimzed code
 clang -fprofile-instr-generate ${FILENAME}.bc -o ${FILENAME}_not_value_profiled
 # Generate binary executable after FPLICM: Optimized code
 clang -fprofile-instr-generate ${FILENAME}.value_profiled.bc -o ${FILENAME}_value_profiled
+
+# Binary AFTER your pass + O2
+clang -fprofile-instr-generate ${FILENAME}.value_profiled.O2.bc -o ${FILENAME}_value_profiled_O2
 
 rm ${FILENAME}.bc
 
