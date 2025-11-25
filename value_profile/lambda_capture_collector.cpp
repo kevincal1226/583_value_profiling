@@ -56,7 +56,7 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
     /// Determine whether a StoreInst writes into a lambda closure struct.
     /// Pattern:
     ///     store V, (gep %lambda_struct, ...)
-    static bool isLambdaCaptureStore(const StoreInst *SI) {
+    static bool isLambdaCaptureStore(StoreInst *SI) {
         if (SI == nullptr) {
             return false;
         }
@@ -82,7 +82,7 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
 
     /// Extract the lambda closure StructType from a StoreInst.
     /// Precondition: SI must satisfy isLambdaCaptureStore(SI).
-    static StructType *getLambdaStruct(const StoreInst *SI) {
+    static StructType *getLambdaStruct(StoreInst *SI) {
         if (SI == nullptr) {
             return nullptr;
         }
@@ -109,12 +109,12 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
     /// Extract the captured value from a lambda capture store.
     /// Only supports integer captures (i32 or i64). Returns nullptr otherwise.
     /// Precondition: SI is a lambda capture store (checked by caller).
-    static const Value *getCapturedValue(const StoreInst *SI) {
+    static Value *getCapturedValue(StoreInst *SI) {
         if (SI == nullptr) {
             return nullptr;
         }
 
-        const Value *V = SI->getValueOperand();
+        Value *V = SI->getValueOperand();
         if (V == nullptr) {
             return nullptr;
         }
@@ -163,7 +163,7 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
         return -1; // non-constant indexing (unlikely for lambda captures)
     }
 
-    static void handleCaptureStore(Function &F, const StoreInst *SI) {
+    static void handleCaptureStore(Function &F, StoreInst *SI) {
         auto *ST = getLambdaStruct(SI);
         auto *value = getCapturedValue(SI);
         int field = getCaptureFieldIndex(SI);
@@ -174,6 +174,37 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
         errs() << "  Value: ";
         value->print(errs());
         errs() << "\n";
+
+        std::string siteKey = ST->getName().str();
+
+        Module &M = *F.getParent();
+        LLVMContext &Ctx = M.getContext();
+
+        // Insert at the end of the basic block containing the store
+        BasicBlock *BB = SI->getParent();
+        IRBuilder<> Builder(BB); // <- THIS ONLY TAKES A BasicBlock*, no iterator
+
+        // Create a global constant string for the site key
+        Constant *siteConst = Builder.CreateGlobalString(siteKey);
+
+        Type *i8PtrTy = Type::getInt8Ty(Ctx);
+        Type *i64Ty = Type::getInt64Ty(Ctx);
+
+        FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), {i8PtrTy, i64Ty}, false);
+
+        FunctionCallee recordFn = M.getOrInsertFunction("record_capture", FT);
+
+        // Promote 32-bit to 64-bit if needed
+        Value *intVal = value;
+        if (value->getType()->isIntegerTy(32)) {
+            intVal = Builder.CreateSExt(value, i64Ty);
+        }
+        else if (!value->getType()->isIntegerTy(64)) {
+            // Only support i32/i64 captures for now
+            return;
+        }
+
+        Builder.CreateCall(recordFn, {siteConst, intVal});
     }
 
   public:
