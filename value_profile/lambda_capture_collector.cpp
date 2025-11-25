@@ -34,31 +34,23 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
     /// This is intentionally simple and only checks Clang-style naming.
     /// We can refine later if needed.
     static bool isLambdaStruct(StructType *ST) {
-        if (ST == nullptr) {
-            return false;
-        }
-
-        // Must be a named struct, lambdas never appear as literal { i32 } types.
-        if (!ST->hasName()) {
+        if (ST == nullptr || !ST->hasName()) {
             return false;
         }
 
         StringRef name = ST->getName();
 
-        if (!name.contains("ZZ")) {
-            return false;
+        // Case 1: Clang mangled lambda types
+        if (name.contains("ZZ") && name.contains("ENK")) {
+            return true;
         }
 
-        if (!name.contains("ENK")) {
-            return false;
+        // Case 2: Clang anonymous lambda structs
+        if (name.contains("class.anon") || name.contains("struct.anon")) {
+            return true;
         }
 
-        // Must have at least one field (it captures something)
-        if (ST->getNumElements() == 0) {
-            return false;
-        }
-
-        return true;
+        return false;
     }
 
     /// Determine whether a StoreInst writes into a lambda closure struct.
