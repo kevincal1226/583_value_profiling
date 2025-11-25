@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Run script for Homework 2 CSE 583 Fall 2025
+# e.g. sh run.sh benchmarks/correctness/hw2correct1.c
+set -e
+set -Eeuo pipefail
+
+# ACTION NEEDED: If the path is different, please update it here.
+LIB="build/value_profile/ValueProfilingPass.dylib"
+
+mkdir -p build
+cd build
+cmake -D CMAKE_C_CMPILER=/usr/bin/clang -D CMAKE_CXX_COMPILER=/usr/bin/clang++ ..
+make
+cd ..
+
+CURRENT_DIR=$(pwd)
+
+PATH2LIB=$(realpath "$LIB")
+SELECTED_PASS=lambda_capture_collector
+
+SRC_FILE=$1
+FILE_BASENAME=$(basename $SRC_FILE)
+# this is to run cpp files and not just c files
+# FILENAME=$FILE_BASENAME
+FILENAME=${FILE_BASENAME%.*}
+
+cd $(dirname $SRC_FILE)
+
+# Convert source code to bitcode (IR).
+clang -emit-llvm -fno-discard-value-names -c ${FILENAME}.cpp -Xclang -disable-O0-optnone -o ${FILENAME}.bc
+
+# Canonicalize natural loops (Ref: llvm.org/doxygen/LoopSimplify_8h_source.html)
+opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.bc
+
+##############################################
+#            RUN YOUR PASS
+##############################################
+
+# We now use the profile augmented bc file as input to your pass.
+opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_profiled.bc >/dev/null
