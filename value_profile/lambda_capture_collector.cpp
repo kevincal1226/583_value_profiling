@@ -30,6 +30,9 @@ namespace {
 
 class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
 
+    GlobalValue *global_fileptr{};
+    std::string log_directory;
+
     /// Determine whether a StructType looks like a lambda closure.
     /// This is intentionally simple and only checks Clang-style naming.
     /// We can refine later if needed.
@@ -163,7 +166,7 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
         return -1; // non-constant indexing (unlikely for lambda captures)
     }
 
-    static void handleCaptureStore(Function &F, StoreInst *SI) {
+    void handleCaptureStore(Function &F, StoreInst *SI, Module &module, LLVMContext &context) {
         auto *ST = getLambdaStruct(SI);
         auto *value = getCapturedValue(SI);
         int field = getCaptureFieldIndex(SI);
@@ -175,41 +178,70 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
         value->print(errs());
         errs() << "\n";
 
-        std::string siteKey = ST->getName().str();
+        IRBuilder<> builder{SI};
 
-        Module &M = *F.getParent();
-        LLVMContext &Ctx = M.getContext();
+        const std::string lambda_name = ST->getName().str();
 
-        // Insert at the end of the basic block containing the store
-        BasicBlock *BB = SI->getParent();
-        IRBuilder<> Builder(BB); // <- THIS ONLY TAKES A BasicBlock*, no iterator
+        // get the variables name and create the fmt string for it
+        GlobalVariable *const fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " %p\n");
 
-        // Create a global constant string for the site key
-        Constant *siteConst = Builder.CreateGlobalString(siteKey);
+        // get pointers to the fmt string and function
+        Value *const fmt_ptr = builder.CreateBitCast(fmt, PointerType::get(context, 0));
 
-        Type *i8PtrTy = Type::getInt8Ty(Ctx);
-        Type *i64Ty = Type::getInt64Ty(Ctx);
+        // insert the actual call
+        Value *file_ptr = builder.CreateLoad(builder.getPtrTy(), global_fileptr);
+        builder.CreateCall(get_or_insert_fprintf_func(module), {file_ptr, fmt_ptr, value});
+    }
 
-        FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), {i8PtrTy, i64Ty}, false);
+    static auto make_fmt(Module &module, LLVMContext &context, std::string const &str) -> GlobalVariable * {
+        Constant *const fmt_data = ConstantDataArray::getString(context, str, true);
+        auto *const fmt =
+            new GlobalVariable(module, fmt_data->getType(), true, GlobalValue::PrivateLinkage, fmt_data, ".fmt");
 
-        FunctionCallee recordFn = M.getOrInsertFunction("record_capture", FT);
+        return fmt;
+    }
 
-        // Promote 32-bit to 64-bit if needed
-        Value *intVal = value;
-        if (value->getType()->isIntegerTy(32)) {
-            intVal = Builder.CreateSExt(value, i64Ty);
-        }
-        else if (!value->getType()->isIntegerTy(64)) {
-            // Only support i32/i64 captures for now
-            return;
-        }
+    auto insert_fopen(Module &module, LLVMContext &context, IRBuilder<> &builder, std::string const &filename)
+        -> void { // create a global pointer for the output file
+        global_fileptr =
+            new GlobalVariable(module, PointerType::get(context, 0), false, GlobalValue::ExternalLinkage,
+                               llvm::ConstantPointerNull::get(PointerType::get(context, 0)), "global_file_ptr");
 
-        Builder.CreateCall(recordFn, {siteConst, intVal});
+        PointerType *const ptr_ty = PointerType::get(context, 0);
+        FunctionType *const fopen_type = FunctionType::get(ptr_ty, {ptr_ty, ptr_ty}, false);
+        FunctionCallee const fopen_func = module.getOrInsertFunction("fopen", fopen_type);
+
+        // Format string literals
+        auto *const filename_str = builder.CreateGlobalString(filename);
+        auto *const mode_str = builder.CreateGlobalString("w");
+
+        // Call fopen
+        Value *const file_ptr_value = builder.CreateCall(fopen_func, {filename_str, mode_str});
+
+        // save it in global variable
+        builder.CreateStore(file_ptr_value, global_fileptr);
+    }
+
+    static auto get_or_insert_fprintf_func(llvm::Module &M) -> llvm::FunctionCallee {
+        LLVMContext &ctx = M.getContext();
+
+        FunctionType *fprintf_type =
+            FunctionType::get(llvm::Type::getInt32Ty(ctx), {PointerType::get(ctx, 0), PointerType::get(ctx, 0)}, true);
+
+        return M.getOrInsertFunction("fprintf", fprintf_type);
     }
 
   public:
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
-        errs() << "HERE\n";
+        LLVMContext &context = M.getContext();
+
+        BasicBlock &main_func_bb = *M.getFunction("main")->begin();
+
+        if (global_fileptr == nullptr) {
+            IRBuilder<> builder(&main_func_bb, main_func_bb.begin());
+            insert_fopen(M, context, builder, log_directory);
+        }
+
         for (Function &F : M) {
             for (BasicBlock &BB : F) {
                 for (Instruction &I : BB) {
@@ -218,7 +250,7 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
                     if (auto *SI = dyn_cast<StoreInst>(&I)) {
                         // we only care about lamabda capture stores
                         if (isLambdaCaptureStore(SI)) {
-                            handleCaptureStore(F, SI);
+                            handleCaptureStore(F, SI, M, context);
                         }
                     }
                 }
