@@ -31,7 +31,7 @@ namespace {
 class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
 
     GlobalValue *global_fileptr{};
-    std::string log_directory;
+    std::string log_directory = "logs/lambda_logs.txt";
 
     /// Determine whether a StructType looks like a lambda closure.
     /// This is intentionally simple and only checks Clang-style naming.
@@ -182,15 +182,30 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
 
         const std::string lambda_name = ST->getName().str();
 
-        // get the variables name and create the fmt string for it
-        GlobalVariable *const fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " %p\n");
+        Value *int_arg = value;
+        Type *ty = int_arg->getType();
 
-        // get pointers to the fmt string and function
-        Value *const fmt_ptr = builder.CreateBitCast(fmt, PointerType::get(context, 0));
+        if (!ty->isIntegerTy()) {
+            errs() << "Expected integer capture for printing\n";
+            return;
+        }
 
-        // insert the actual call
+        // Promote anything smaller than 64 bits
+        if (ty->getIntegerBitWidth() < 64) {
+            int_arg = builder.CreateZExt(int_arg, builder.getInt64Ty());
+        }
+        else if (ty->getIntegerBitWidth() > 64) {
+            // Avoid oversized integer UB — truncate (or reconsider formatting)
+            int_arg = builder.CreateTrunc(int_arg, builder.getInt64Ty());
+        }
+
+        // Format string using %ld for 64-bit integer
+        auto *fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " %ld\n");
+
+        Value *fmt_ptr = builder.CreateBitCast(fmt, builder.getPtrTy());
         Value *file_ptr = builder.CreateLoad(builder.getPtrTy(), global_fileptr);
-        builder.CreateCall(get_or_insert_fprintf_func(module), {file_ptr, fmt_ptr, value});
+
+        builder.CreateCall(get_or_insert_fprintf_func(module), {file_ptr, fmt_ptr, int_arg});
     }
 
     static auto make_fmt(Module &module, LLVMContext &context, std::string const &str) -> GlobalVariable * {
