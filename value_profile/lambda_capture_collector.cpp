@@ -199,13 +199,24 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
             int_arg = builder.CreateTrunc(int_arg, builder.getInt64Ty());
         }
 
-        // Format string using %ld for 64-bit integer
-        auto *fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " %ld\n");
+        auto *fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " field=%d value=%ld\n");
 
         Value *fmt_ptr = builder.CreateBitCast(fmt, builder.getPtrTy());
         Value *file_ptr = builder.CreateLoad(builder.getPtrTy(), global_fileptr);
 
-        builder.CreateCall(get_or_insert_fprintf_func(module), {file_ptr, fmt_ptr, int_arg});
+        // field index is a normal C++ int → make LLVM i32
+        Value *field_val = builder.getInt32(field);
+
+        // captured value: print as %ld (i64)
+        Value *long_val = int_arg; // already zext/trunc to i64 above
+
+        builder.CreateCall(get_or_insert_fprintf_func(module),
+                           {
+                               file_ptr,  // FILE*
+                               fmt_ptr,   // const char*
+                               field_val, // %d
+                               long_val   // %ld
+                           });
     }
 
     static auto make_fmt(Module &module, LLVMContext &context, std::string const &str) -> GlobalVariable * {

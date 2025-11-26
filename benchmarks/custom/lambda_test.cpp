@@ -1,22 +1,17 @@
-
-#include <functional>
-#include <iostream>
-#include <vector>
-
 int main() {
     int x = 0;
+    int a = 4;
+    int b = 5;
 
-    std::cerr << "start\n";
+    for (int i = 0; i < 100; ++i) {
+        x = i + 7;
 
-    auto z = [x](int y) {
-        return (y * 2) + x; // lambda operator()
-    };
+        auto z = [x, a, b](int y) {
+            return (y * 2) + x + a + b; // lambda operator()
+        };
 
-    std::cerr << "after first lambda\n";
-
-    auto t = [x](int y) {
-        return (y * 2) + x + 1; // lambda operator()
-    };
-
-    std::cerr << "end\n";
+        auto t = [x, b](int y) {
+            return (y * 2) + x + 1 + b; // lambda operator()
+        };
+    }
 }
