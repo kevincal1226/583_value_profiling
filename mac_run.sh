@@ -13,8 +13,6 @@ cmake -D CMAKE_C_CMPILER=/usr/bin/clang -D CMAKE_CXX_COMPILER=/usr/bin/clang++ .
 make
 cd ..
 
-./value_profile/run_profiler $1
-
 if [ ! -f "$LIB" ]; then
     echo "Could not find $LIB. Please build your pass or correct the path in the script."
     exit 1
@@ -133,7 +131,7 @@ opt -S -load-pass-plugin="${PATH2LIB}" -passes="value_profiler" ${FILENAME}.bc -
 
 clang -fprofile-instr-generate ${FILENAME}.profiler.bc -o ${FILENAME}_profiler
 
-./${FILENAME}_profiler
+(gtimeout 0.5s ./${FILENAME}_profiler >/dev/null) || true
 
 # We now use the profile augmented bc file as input to your pass.
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_profiled.bc >/dev/null

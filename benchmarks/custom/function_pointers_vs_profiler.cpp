@@ -30,11 +30,13 @@ int main() {
     // printf("%p\n", q2);
     // fclose(q2);
 
+    for (int i = 0; i < 100000000; ++i) {
+        int (*x)(int) = bar;
+        foo(bar);
 
-    int (*x)(int) = bar;
-    foo(bar);
-
-    foo(barf);
+        foo(barf);
+        printf("x");
+    }
 
     return 0;
 }

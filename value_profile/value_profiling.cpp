@@ -1,7 +1,10 @@
+#include <algorithm>
+#include <cstdint>
 #include <fstream>
 // #pragma message "Compile me HARDER Oh YEAHHHHH it compiles so GOOOOOODDD"
 #include <iostream>
 #include <iterator>
+#include <ranges>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -278,26 +281,87 @@ struct SpecializeFunctions : public PassInfoMixin<SpecializeFunctions> {
 };
 
 struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
+    static constexpr double optimize_threshold = 0.5;
+
     using instruction_name_t = std::string;
-    std::unordered_map<instruction_name_t, std::vector<Function*>> optimizable_indirect_calls;
+    using function_name_t = std::string;
+    std::unordered_map<instruction_name_t, std::vector<function_name_t>> optimizable_indirect_calls;
+    std::unordered_set<Instruction*> optimized_call_instr;
     // prof_map_t prof_map;
 
     // IndirectCallOptimizer(prof_map_t&& prof_map)
     //     : prof_map(std::move(prof_map)) {}
 
-    auto parse_indirect_call_data(std::string_view file) {}
+    auto parse_indirect_call_data(std::string const& file) {
+        std::unordered_map<std::string, function_name_t> func_ptr_to_func_name;
+        std::unordered_map<instruction_name_t, std::unordered_map<function_name_t, uint32_t>> indirect_call_counts;
 
-    IndirectCallOptimizer(std::string_view file) { parse_indirect_call_data(file); }
+        // parse the log data
+        std::ifstream fs { file };
+        std::string log_type;
+        while (fs >> log_type) {
+            if (log_type == "FMAP") {
+                std::string fptr;
+                std::string func_name;
+                std::string trash;
 
-    auto replace_indirect_call_with(Function& func, BasicBlock& before_bb, CallInst* const call_instr,
+                if (!(fs >> fptr) || !(fs >> trash) || !(fs >> func_name)) {
+                    break;
+                }
+
+                assert(!func_ptr_to_func_name.contains(fptr));
+                assert(indirect_call_counts.empty());
+
+                func_ptr_to_func_name[fptr] = func_name;
+            } else if (log_type == "ICALL") {
+                std::string var_name;
+                std::string f_ptr;
+
+                if (!(fs >> var_name) || !(fs >> f_ptr)) {
+                    break;
+                }
+
+                assert(func_ptr_to_func_name.contains(f_ptr));
+
+                auto const& func_name = func_ptr_to_func_name[f_ptr];
+
+                indirect_call_counts[var_name][func_name] += 1;
+            }
+        }
+
+        optimizable_indirect_calls
+          = indirect_call_counts
+          | std::ranges::views::transform(
+              [](std::pair<instruction_name_t, std::unordered_map<function_name_t, uint32_t>> const& func_calls)
+                -> std::pair<instruction_name_t, std::vector<function_name_t>> {
+                  auto const total_calls
+                    = std::ranges::fold_left(func_calls.second | std::ranges::views::values, 0,
+                                             [](uint32_t curr, uint32_t v) -> uint32_t { return curr + v; });
+
+                  return { func_calls.first,
+                           func_calls.second
+                             | std::ranges::views::filter(
+                               [total_calls](std::pair<function_name_t, uint32_t> const& kv) -> bool {
+                                   return kv.second / static_cast<double>(total_calls) >= optimize_threshold;
+                               })
+                             | std::ranges::views::keys | std::ranges::to<std::vector<function_name_t>>() };
+              })
+          | std::ranges::to<std::unordered_map<instruction_name_t, std::vector<function_name_t>>>();
+    }
+
+    IndirectCallOptimizer(std::string const& file) { parse_indirect_call_data(file); }
+
+    auto replace_indirect_call_with(Function& func, CallInst* const call_instr,
                                     std::vector<Function*> const& functions) {
         if (functions.empty()) {
             return;
         }
 
-        BasicBlock* const after_bb = before_bb.splitBasicBlock(call_instr, "after_call");
+        auto const before_bb = call_instr->getParent();
 
-        auto& context = before_bb.getContext();
+        BasicBlock* const after_bb = before_bb->splitBasicBlock(call_instr, "after_call");
+
+        auto& context = before_bb->getContext();
 
         IRBuilder<> builder { after_bb, after_bb->begin() };
 
@@ -338,6 +402,7 @@ struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
 
             // create the else block
             auto const new_call_instr = call_instr->clone();
+            optimized_call_instr.insert(new_call_instr);
 
             builder.SetInsertPoint(else_bb);
             builder.Insert(new_call_instr);
@@ -354,7 +419,7 @@ struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
             self(else_bb, function_i + 1);
         };
 
-        substitute_functions(&before_bb);
+        substitute_functions(before_bb);
 
         if (phi != nullptr) {
             call_instr->replaceAllUsesWith(phi);
@@ -364,11 +429,11 @@ struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
     }
 
     auto run(Function& F, FunctionAnalysisManager& FAM) -> PreservedAnalyses {
-        for (auto bb_it = F.begin(); bb_it != F.end();) {
-            auto& bb = *bb_it++;
-            for (auto instruction_it = bb.begin(); instruction_it != bb.end();) {
-                auto& instruction = *instruction_it++;
+        auto module = F.getParent();
 
+        std::vector<std::pair<CallInst*, std::vector<Function*>>> calls_to_optimize;
+        for (auto& bb : F) {
+            for (auto& instruction : bb) {
                 auto const call_instr = dyn_cast<CallInst>(&instruction);
 
                 if (call_instr == nullptr) {
@@ -380,21 +445,36 @@ struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
                     continue;
                 }
 
-                // TODO: user profile data
-                assert(false);
-                // if (!optimizable_indirect_calls.contains(call_instr)) {
-                //     continue;
-                // }
 
-                // replace_indirect_call_with(F, bb, call_instr, optimizable_indirect_calls[call_instr]);
+                auto const call_name = call_instr->getCalledOperand()->getNameOrAsOperand();
+                if (!optimizable_indirect_calls.contains(call_name)) {
+                    continue;
+                }
+
+                if (optimized_call_instr.contains(&instruction)) {
+                    continue;
+                }
+
+                auto const functions
+                  = optimizable_indirect_calls[call_name]
+                  | std::ranges::views::transform(
+                      [module](std::string const& func_name) -> Function* { return module->getFunction(func_name); })
+                  | std::ranges::to<std::vector<Function*>>();
+
+                assert(!functions.empty());
+
+                calls_to_optimize.emplace_back(call_instr, functions);
             }
+        }
+
+        for (auto& [call_instr, functions] : calls_to_optimize) {
+            replace_indirect_call_with(F, call_instr, functions);
         }
 
         return PreservedAnalyses::none();
     }
 };
 
-// TODO: make it so the prints go to an actual file
 struct ValueProfiler : PassInfoMixin<ValueProfiler> {
     GlobalValue* global_fileptr {};
     std::string log_directory;
@@ -503,6 +583,7 @@ struct ValueProfiler : PassInfoMixin<ValueProfiler> {
             }
         }
 
+
         return PreservedAnalyses::none();
     }
 };
@@ -521,11 +602,10 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                            return true;
                        }
 
-                       // TODO: incomplete pass
-                       // if (Name == "value_indirect_call") {
-                       //     FPM.addPass(IndirectCallOptimizer(""));
-                       //     return true;
-                       // }
+                       if (Name == "value_indirect_call") {
+                           FPM.addPass(IndirectCallOptimizer("../../logs/value_pass_information.txt"));
+                           return true;
+                       }
 
                        if (Name == "value_specialize") {
                            FPM.addPass(SpecializeFunctions(parse_data("../../profile_stats.txt")));
