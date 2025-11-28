@@ -9,13 +9,13 @@ void hi() {
     // printf("memes");
 }
 
-void foo(int (*x)(int)) {
-    x(3);
-    // printf("%d", x(3));
-}
+// void foo(int (*x)(int), int a, int b, int c, int d) {
+//     x(a, b, c, d);
+//     // printf("%d", x(3));
+// }
 
-int bar(int y) {
-    return y * 1000;
+inline int bar(int a, int b, int c, int d) {
+    return a * b * c * d;
 }
 
 int barf(int y) {
@@ -30,12 +30,13 @@ int main() {
     // printf("%p\n", q2);
     // fclose(q2);
 
-    for (int i = 0; i < 100000000; ++i) {
-        int (*x)(int) = bar;
-        foo(bar);
+    int (*x)(int, int, int, int) = bar;
+    for (int i = 0; i < 500000000; ++i) {
+        int total = x(i, i + 1, i + 2, i + 3);
+        total * 2;
 
-        foo(barf);
-        printf("x");
+        // foo(barf);
+        printf("%d", total);
     }
 
     return 0;

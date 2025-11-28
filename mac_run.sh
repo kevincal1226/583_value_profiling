@@ -129,7 +129,7 @@ opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.bc
 # run the value profiler thing
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="value_profiler" ${FILENAME}.bc -o ${FILENAME}.profiler.bc >/dev/null
 
-clang -fprofile-instr-generate ${FILENAME}.profiler.bc -o ${FILENAME}_profiler
+clang++ -fprofile-instr-generate ${FILENAME}.profiler.bc -o ${FILENAME}_profiler
 
 (gtimeout 0.5s ./${FILENAME}_profiler >/dev/null) || true
 
@@ -137,22 +137,22 @@ clang -fprofile-instr-generate ${FILENAME}.profiler.bc -o ${FILENAME}_profiler
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_profiled.bc >/dev/null
 
 ##############################################
-#     RUN O2 OPTIMIZATIONS AFTER YOUR PASS
+#     RUN O3 OPTIMIZATIONS AFTER YOUR PASS
 ##############################################
-opt -S -passes='default<O2>' ${FILENAME}.value_profiled.bc -o ${FILENAME}.value_profiled.O2.bc
+opt -S -passes='default<O3>' ${FILENAME}.value_profiled.bc -o ${FILENAME}.value_profiled.O3.bc
 
 ##############################################
-#     RUN O2 OPTIMIZATIONS WITHOUT PASS
+#     RUN O3 OPTIMIZATIONS WITHOUT PASS
 ##############################################
-opt -S -passes='default<O2>' ${FILENAME}.bc -o ${FILENAME}.not_value_profiled.O2.bc
+opt -S -passes='default<O3>' ${FILENAME}.bc -o ${FILENAME}.not_value_profiled.O3.bc
 
 # Generate binary excutable before FPLICM: Unoptimzed code
-clang -fprofile-instr-generate ${FILENAME}.bc -o ${FILENAME}_not_value_profiled
+clang++ -fprofile-instr-generate ${FILENAME}.bc -o ${FILENAME}_not_value_profiled
 # Generate binary executable after FPLICM: Optimized code
-clang -fprofile-instr-generate ${FILENAME}.value_profiled.bc -o ${FILENAME}_value_profiled
+clang++ -fprofile-instr-generate ${FILENAME}.value_profiled.bc -o ${FILENAME}_value_profiled
 
-# Binary AFTER your pass + O2
-clang -fprofile-instr-generate ${FILENAME}.value_profiled.O2.bc -o ${FILENAME}_value_profiled_O2
+# Binary AFTER your pass + O3
+clang++ -fprofile-instr-generate ${FILENAME}.value_profiled.O3.bc -o ${FILENAME}_value_profiled_O3
 
 generate_cfg_viz() {
     VIZ_TYPE=cfg
