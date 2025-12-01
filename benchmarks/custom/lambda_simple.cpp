@@ -3,9 +3,7 @@
 #include <vector>
 
 int main() {
-    std::vector<std::function<int(int)>> funcs;
-    funcs.reserve(10000);
-
+    int sum = 0;
     for (int i = 0; i < 10000; i++) {
         int x;
 
@@ -18,14 +16,12 @@ int main() {
         }
 
         // each loop iteration constructs a NEW lambda closure
-        funcs.push_back([x](int y) {
+        auto z = ([x](int y) {
             return (y * 2) + x; // lambda operator()
         });
+
+        sum += z(100);
     }
 
-    int sum = 0;
-    for (auto &fn : funcs)
-        sum += fn(5);
-
-    std::cout << sum << "\n";
+    std::cout << sum << std::endl;
 }

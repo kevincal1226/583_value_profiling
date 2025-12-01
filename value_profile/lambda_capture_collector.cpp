@@ -199,7 +199,7 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
             int_arg = builder.CreateTrunc(int_arg, builder.getInt64Ty());
         }
 
-        auto *fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " field=%d value=%ld\n");
+        auto *fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " %d %ld\n");
 
         Value *fmt_ptr = builder.CreateBitCast(fmt, builder.getPtrTy());
         Value *file_ptr = builder.CreateLoad(builder.getPtrTy(), global_fileptr);
