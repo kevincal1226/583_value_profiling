@@ -2,6 +2,7 @@
 #include "llvm/Passes/PassPlugin.h"
 
 #include "lambda_capture_collector.cpp"
+#include "lambda_optimizer.cpp"
 #include "value_profiling.cpp"
 
 using namespace llvm;
@@ -26,6 +27,15 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                     [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
                         if (Name == "lambda_capture_collector") {
                             MPM.addPass(LambdaCaptureCollector());
+                            return true;
+                        }
+                        return false;
+                    });
+
+                PB.registerPipelineParsingCallback(
+                    [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
+                        if (Name == "lambda_optimizer") {
+                            MPM.addPass(LambdaOptimizer());
                             return true;
                         }
                         return false;

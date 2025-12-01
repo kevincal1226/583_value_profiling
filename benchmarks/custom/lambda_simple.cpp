@@ -16,9 +16,9 @@ int main() {
         }
 
         // each loop iteration constructs a NEW lambda closure
-        auto z = ([x](int y) {
+        auto z = [x](int y) {
             return (y * 2) + x; // lambda operator()
-        });
+        };
 
         sum += z(100);
     }

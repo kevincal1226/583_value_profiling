@@ -31,7 +31,7 @@ namespace {
 class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
 
     GlobalValue *global_fileptr{};
-    std::string log_directory = "logs/lambda_logs.txt";
+    std::string log_directory = "../../logs/lambda_logs.txt";
 
     /// Determine whether a StructType looks like a lambda closure.
     /// This is intentionally simple and only checks Clang-style naming.
