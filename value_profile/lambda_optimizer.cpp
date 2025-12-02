@@ -641,11 +641,11 @@ class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
     bool handleEscapingLambda(StructType *CT, const LambdaCaptureKey &Key, const CaptureProfile &Prof,
                               Function *HotClone, Module &M) {
         bool Changed = false;
+        LLVMContext &Ctx = M.getContext();
 
-        // Step 1: Create a hot thunk
+        // Create a hot thunk once
         Function *HotThunk = createHotInvokerThunk(HotClone, CT);
 
-        // Step 2: Scan for constructions
         for (Function &F : M) {
             for (BasicBlock &BB : F) {
 
@@ -654,50 +654,45 @@ class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
                     if (!SI)
                         continue;
 
-                    // Is this storing the capture field?
                     auto *GEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());
-                    if (!GEP)
+                    if (!GEP || GEP->getSourceElementType() != CT)
                         continue;
 
-                    if (GEP->getSourceElementType() != CT)
-                        continue;
-
-                    // match capture field
+                    // Must be storing the capture field for this Key
                     auto it = GEP->idx_begin();
                     ++it;
-                    auto *CI = dyn_cast<ConstantInt>(*it);
-                    if (!CI || (int)CI->getZExtValue() != Key.FieldIndex)
+                    auto *Field = dyn_cast<ConstantInt>(*it);
+                    if (!Field || Field->getZExtValue() != Key.FieldIndex)
                         continue;
 
-                    // Found a capture store for an escaping lambda
+                    // Value being stored into the capture
                     Value *CapturedVal = SI->getValueOperand();
+                    auto *IntTy = dyn_cast<IntegerType>(CapturedVal->getType());
+                    if (!IntTy)
+                        continue;
+
+                    // Now find the fnptr store related to this lambda struct
                     auto FnInfo = findFnptrStoreForConstruction(CT, &BB, GEP->getPointerOperand());
+
                     if (!FnInfo.Store)
                         continue;
 
-                    // Insert hot/cold guard
-                    IRBuilder<> B(SI->getNextNode());
-                    Value *IsHot = B.CreateICmpEQ(CapturedVal, ConstantInt::get(CapturedVal->getType(), Prof.HotValue));
+                    // Emit hot check right before fn pointer store
+                    IRBuilder<> B(FnInfo.Store);
 
-                    // Split block
-                    BasicBlock *OrigBB = BB.splitBasicBlock(FnInfo.Store, "lambda.escape.merge");
-                    BasicBlock *HotBB = BasicBlock::Create(M.getContext(), "lambda.escape.hot", &F, OrigBB);
-                    BasicBlock *ColdBB = BasicBlock::Create(M.getContext(), "lambda.escape.cold", &F, OrigBB);
+                    Constant *HotConst = ConstantInt::get(IntTy, Prof.HotValue);
 
-                    // Replace unconditional branch
-                    BB.getTerminator()->eraseFromParent();
-                    IRBuilder<> BrB(&BB);
-                    BrB.CreateCondBr(IsHot, HotBB, ColdBB);
+                    Value *IsHot = B.CreateICmpEQ(CapturedVal, HotConst);
 
-                    // HotBB: store hot thunk
-                    IRBuilder<> HB(HotBB);
-                    HB.CreateStore(HotThunk, FnInfo.Store->getPointerOperand());
-                    HB.CreateBr(OrigBB);
+                    // Replace store operand with select(HotThunk, OrigThunk)
+                    Value *OrigThunk = FnInfo.Store->getValueOperand();
 
-                    // ColdBB: store original thunk
-                    IRBuilder<> CB(ColdBB);
-                    CB.CreateStore(FnInfo.Store->getValueOperand(), FnInfo.Store->getPointerOperand());
-                    CB.CreateBr(OrigBB);
+                    Value *SelThunk = B.CreateSelect(IsHot, HotThunk, OrigThunk, "lambda.fnptr.sel");
+
+                    FnInfo.Store->setOperand(0, SelThunk);
+
+                    llvm::errs() << "[lambda-opt] Patched escaping closure for " << CT->getName() << " field "
+                                 << Key.FieldIndex << " → fnptr hot thunk\n";
 
                     Changed = true;
                 }

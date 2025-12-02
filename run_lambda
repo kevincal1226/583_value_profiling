@@ -49,8 +49,18 @@ clang++ -fprofile-instr-generate ${FILENAME}.lambda_profiler.bc -o ${FILENAME}_l
 ./"${FILENAME}_lambda_profiler" >/dev/null
 
 ##############################################
+#            COLLECT RESULTS
+##############################################
+
+cd ../..
+
+./value_profile/parse_lambda_logs.py logs/lambda_logs.txt
+
+##############################################
 #            OPTIMIZER TIME
 ##############################################
+
+cd $(dirname $SRC_FILE)
 
 SELECTED_PASS=lambda_optimizer
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_lambda_profiled.bc >/dev/null
