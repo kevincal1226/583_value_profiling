@@ -40,7 +40,7 @@ opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.bc
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.lambda_profiler.bc >/dev/null
 
 # Generate binary executable after FPLICM: Optimized code
-clang++ -fprofile-instr-generate ${FILENAME}.value_profiled.bc -o ${FILENAME}_lambda_profiler
+clang++ -fprofile-instr-generate ${FILENAME}.lambda_profiler.bc -o ${FILENAME}_lambda_profiler
 
 ##############################################
 #            RUN VALUE PROFILER
@@ -54,3 +54,6 @@ clang++ -fprofile-instr-generate ${FILENAME}.value_profiled.bc -o ${FILENAME}_la
 
 SELECTED_PASS=lambda_optimizer
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_lambda_profiled.bc >/dev/null
+
+# Generate binary executable after FPLICM: Optimized code
+clang++ -fprofile-instr-generate ${FILENAME}.value_lambda_profiled.bc -o ${FILENAME}_value_lambda_profiled

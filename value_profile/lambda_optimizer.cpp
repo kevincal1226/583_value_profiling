@@ -118,6 +118,11 @@ CaptureProfileMap loadCaptureProfiles(const std::string &Path) {
     return Profiles;
 }
 
+struct FnptrStoreInfo {
+    StoreInst *Store; // the store of the function pointer
+    int FieldIndex;   // which field in the closure struct
+};
+
 class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
 
     // Find the StructType representing the lambda closure for this key.
@@ -513,6 +518,7 @@ class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
             {
                 IRBuilder<> HotBuilder(HotBB);
                 if (RetTy->isVoidTy()) {
+
                     HotBuilder.CreateCall(HotClone, Args);
                     HotBuilder.CreateBr(MergeBB);
                 }
@@ -559,6 +565,148 @@ class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
         return Changed;
     }
 
+    Function *createHotInvokerThunk(Function *HotClone, StructType *ClosureTy) {
+        // same type as the original thunk: (ptr closure, args...) -> ret
+        auto FTy = HotClone->getFunctionType();
+        auto *Thunk =
+            Function::Create(FTy, HotClone->getLinkage(), HotClone->getName() + ".thunk", HotClone->getParent());
+
+        IRBuilder<> B(BasicBlock::Create(Thunk->getContext(), "entry", Thunk));
+        SmallVector<Value *, 8> Args;
+        for (auto &A : Thunk->args())
+            Args.push_back(&A);
+
+        Value *R = B.CreateCall(HotClone, Args);
+        B.CreateRet(R);
+        return Thunk;
+    }
+    static FnptrStoreInfo findFnptrStoreForConstruction(StructType *ClosureTy, BasicBlock *BB, Value *ClosurePtr) {
+        FnptrStoreInfo Result{nullptr, -1};
+
+        if (!ClosureTy || !BB || !ClosurePtr)
+            return Result;
+
+        Value *Base = stripPointerCasts(ClosurePtr);
+
+        for (Instruction &I : *BB) {
+            auto *SI = dyn_cast<StoreInst>(&I);
+            if (!SI)
+                continue;
+
+            Value *Ptr = SI->getPointerOperand();
+            auto *GEP = dyn_cast<GetElementPtrInst>(Ptr);
+            if (!GEP)
+                continue;
+
+            // Must be indexing into our closure struct
+            if (GEP->getSourceElementType() != ClosureTy)
+                continue;
+
+            // Confirm this is for the same closure instance
+            if (stripPointerCasts(GEP->getPointerOperand()) != Base)
+                continue;
+
+            // Need at least 2 indices: [0, field]
+            if (GEP->getNumIndices() < 2)
+                continue;
+
+            auto idxIt = GEP->idx_begin();
+            ++idxIt; // move to field index
+            auto *FieldIdx = dyn_cast<ConstantInt>(*idxIt);
+            if (!FieldIdx)
+                continue;
+
+            int Field = FieldIdx->getZExtValue();
+
+            // We only consider this an escaping-lambda fnptr store if the value is a function pointer
+            Value *StoredVal = SI->getValueOperand();
+            if (!StoredVal->getType()->isPointerTy())
+                continue;
+
+            // And it must be a function pointer
+
+            auto *StoredFunc = dyn_cast<Function>(StoredVal);
+            if (!StoredFunc)
+                continue;
+
+            // This is the fnptr store we were looking for
+            Result.Store = SI;
+            Result.FieldIndex = Field;
+            return Result;
+        }
+
+        return Result;
+    }
+
+    bool handleEscapingLambda(StructType *CT, const LambdaCaptureKey &Key, const CaptureProfile &Prof,
+                              Function *HotClone, Module &M) {
+        bool Changed = false;
+
+        // Step 1: Create a hot thunk
+        Function *HotThunk = createHotInvokerThunk(HotClone, CT);
+
+        // Step 2: Scan for constructions
+        for (Function &F : M) {
+            for (BasicBlock &BB : F) {
+
+                for (Instruction &I : BB) {
+                    auto *SI = dyn_cast<StoreInst>(&I);
+                    if (!SI)
+                        continue;
+
+                    // Is this storing the capture field?
+                    auto *GEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());
+                    if (!GEP)
+                        continue;
+
+                    if (GEP->getSourceElementType() != CT)
+                        continue;
+
+                    // match capture field
+                    auto it = GEP->idx_begin();
+                    ++it;
+                    auto *CI = dyn_cast<ConstantInt>(*it);
+                    if (!CI || (int)CI->getZExtValue() != Key.FieldIndex)
+                        continue;
+
+                    // Found a capture store for an escaping lambda
+                    Value *CapturedVal = SI->getValueOperand();
+                    auto FnInfo = findFnptrStoreForConstruction(CT, &BB, GEP->getPointerOperand());
+                    if (!FnInfo.Store)
+                        continue;
+
+                    // Insert hot/cold guard
+                    IRBuilder<> B(SI->getNextNode());
+                    Value *IsHot = B.CreateICmpEQ(CapturedVal, ConstantInt::get(CapturedVal->getType(), Prof.HotValue));
+
+                    // Split block
+                    BasicBlock *OrigBB = BB.splitBasicBlock(FnInfo.Store, "lambda.escape.merge");
+                    BasicBlock *HotBB = BasicBlock::Create(M.getContext(), "lambda.escape.hot", &F, OrigBB);
+                    BasicBlock *ColdBB = BasicBlock::Create(M.getContext(), "lambda.escape.cold", &F, OrigBB);
+
+                    // Replace unconditional branch
+                    BB.getTerminator()->eraseFromParent();
+                    IRBuilder<> BrB(&BB);
+                    BrB.CreateCondBr(IsHot, HotBB, ColdBB);
+
+                    // HotBB: store hot thunk
+                    IRBuilder<> HB(HotBB);
+                    HB.CreateStore(HotThunk, FnInfo.Store->getPointerOperand());
+                    HB.CreateBr(OrigBB);
+
+                    // ColdBB: store original thunk
+                    IRBuilder<> CB(ColdBB);
+                    CB.CreateStore(FnInfo.Store->getValueOperand(), FnInfo.Store->getPointerOperand());
+                    CB.CreateBr(OrigBB);
+
+                    Changed = true;
+                }
+            }
+        }
+
+        return Changed;
+    }
+
   public:
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
         CaptureProfileMap Profiles = loadCaptureProfiles("../../logs/lambda_logs_lambda_profdata.txt");
@@ -580,6 +728,9 @@ class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
                 continue;
             }
 
+            HotClone->removeFnAttr(Attribute::NoInline);
+            HotClone->addFnAttr(Attribute::AlwaysInline);
+
             bool SpecializedBody = specializeCaptureInClone(HotClone, CT, Key, Prof);
 
             if (!SpecializedBody) {
@@ -595,6 +746,8 @@ class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
             // NEW: rewrite call sites to branch between OriginalOp and HotClone.
             bool RewroteCalls = specializeConstructionAndCall(OriginalOp, HotClone, CT, Key, Prof);
             if (!RewroteCalls) {
+                handleEscapingLambda(CT, Key, Prof, HotClone, M);
+
                 llvm::errs() << "[lambda-opt] No call sites rewritten for '" << OriginalOp->getName()
                              << "'; hot clone may remain unused.\n";
             }
