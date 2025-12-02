@@ -37,20 +37,20 @@ opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.bc
 ##############################################
 
 # We now use the profile augmented bc file as input to your pass.
-opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_profiled.bc >/dev/null
+opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.lambda_profiler.bc >/dev/null
 
 # Generate binary executable after FPLICM: Optimized code
-clang++ -fprofile-instr-generate ${FILENAME}.value_profiled.bc -o ${FILENAME}_value_profiled
+clang++ -fprofile-instr-generate ${FILENAME}.value_profiled.bc -o ${FILENAME}_lambda_profiler
 
 ##############################################
 #            RUN VALUE PROFILER
 ##############################################
 
-./"${FILENAME}_value_profiled" >/dev/null
+./"${FILENAME}_lambda_profiler" >/dev/null
 
 ##############################################
 #            OPTIMIZER TIME
 ##############################################
 
 SELECTED_PASS=lambda_optimizer
-opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_profiled.bc >/dev/null
+opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_lambda_profiled.bc >/dev/null

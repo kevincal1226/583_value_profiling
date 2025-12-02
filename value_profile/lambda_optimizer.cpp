@@ -120,18 +120,276 @@ CaptureProfileMap loadCaptureProfiles(const std::string &Path) {
 
 class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
 
+    // Find the StructType representing the lambda closure for this key.
+    // Returns nullptr if not found.
+    static StructType *findClosureType(const Module &M, const LambdaCaptureKey &Key) {
+        const std::string &TargetName = Key.Name;
+
+        for (StructType *ST : M.getIdentifiedStructTypes()) {
+            // Skip opaque types — they have no fields and can't hold captures
+            if (ST->isOpaque()) {
+                continue;
+            }
+
+            // StructType names do NOT include the '%' IR prefix
+            if (ST->hasName() && ST->getName() == TargetName) {
+                return ST;
+            }
+        }
+
+        // Not found — print debug info
+        llvm::errs() << "[lambda-opt] Could not find StructType for lambda '" << TargetName << "' in module.\n";
+
+        return nullptr;
+    }
+
+    // Find the lambda's operator() function given the closure StructType.
+    // We look for a function whose first argument is ClosureTy*,
+    // preferring one whose demangled name contains "operator()".
+    static Function *findLambdaOperatorFunc(Module &M, StructType *ClosureTy) {
+        if (ClosureTy == nullptr) {
+            llvm::errs() << "[lambda-opt] No ClosureType provided.\n";
+            return nullptr;
+        }
+
+        PointerType *ThisPtrTy = ClosureTy->getPointerTo();
+        Function *Fallback = nullptr;
+
+        for (Function &F : M) {
+            // We only care about functions with bodies
+            if (F.isDeclaration()) {
+                continue;
+            }
+
+            // Must have at least one argument
+            if (F.arg_empty()) {
+                continue;
+            }
+
+            Argument &FirstArg = *F.arg_begin();
+            Type *ArgTy = FirstArg.getType();
+
+            // Does the first parameter match "%class.anon*" ?
+            if (ArgTy != ThisPtrTy) {
+                continue;
+            }
+
+            // --- Now this is a candidate operator() ---
+
+            // Try demangling for a more precise match
+            std::string Demangled = llvm::demangle(F.getName().str());
+
+            if (Demangled.find("operator()") != std::string::npos) {
+                // Strong match: this is almost certainly the lambda operator
+                return &F;
+            }
+
+            // Otherwise keep the first match as a fallback
+            if (Fallback == nullptr) {
+                Fallback = &F;
+            }
+        }
+
+        if (Fallback == nullptr) {
+            llvm::errs() << "[lambda-opt] Could not find operator() for lambda struct '" << ClosureTy->getName()
+                         << "'\n";
+        }
+        else {
+            llvm::errs() << "[lambda-opt] Using fallback operator for lambda struct '" << ClosureTy->getName()
+                         << "': " << Fallback->getName() << "\n";
+        }
+
+        return Fallback;
+    }
+
+    // Clone the original operator() into a new function with the same type.
+    // We will then specialize the clone to bake in the hot capture value.
+    static Function *cloneLambdaOperator(Function *OriginalFunc, const LambdaCaptureKey &Key,
+                                         const CaptureProfile &Prof) {
+        if (OriginalFunc == nullptr) {
+            return nullptr;
+        }
+
+        Module *M = OriginalFunc->getParent();
+
+        // Build a unique specialized name
+        std::string NewName = OriginalFunc->getName().str() + ".hot.field" + std::to_string(Key.FieldIndex) + ".value" +
+                              std::to_string(Prof.HotValue);
+
+        // Get original function type
+        FunctionType *FTy = OriginalFunc->getFunctionType();
+
+        // Create the new function shell
+        Function *NewF = Function::Create(FTy, OriginalFunc->getLinkage(), NewName, M);
+
+        NewF->setCallingConv(OriginalFunc->getCallingConv());
+
+        // Map original args -> new args
+        ValueToValueMapTy VMap;
+        {
+            auto A = OriginalFunc->arg_begin();
+            auto B = NewF->arg_begin();
+            for (; A != OriginalFunc->arg_end(); ++A, ++B) {
+                B->setName(A->getName());
+                VMap[&*A] = &*B;
+            }
+        }
+
+        // Clone the body
+        SmallVector<ReturnInst *, 8> Returns; // unused but required by API
+        CloneFunctionInto(NewF, OriginalFunc, VMap, CloneFunctionChangeType::LocalChangesOnly, Returns);
+
+        llvm::errs() << "[lambda-opt] Cloned operator(): " << OriginalFunc->getName() << " -> " << NewF->getName()
+                     << "\n";
+
+        return NewF;
+    }
+
+    // Strip away simple pointer casts so we can see the underlying value.
+    static Value *stripPointerCasts(Value *V) {
+        while (true) {
+            if (auto *BC = dyn_cast<BitCastInst>(V)) {
+                V = BC->getOperand(0);
+            }
+            else if (auto *ASC = dyn_cast<AddrSpaceCastInst>(V)) {
+                V = ASC->getOperand(0);
+            }
+            else {
+                break;
+            }
+        }
+        return V;
+    }
+
+    // In the cloned operator(), replace loads of the captured field with a constant.
+    static bool specializeCaptureInClone(Function *CloneF, StructType *ClosureTy, const LambdaCaptureKey &Key,
+                                         const CaptureProfile &Prof) {
+        if ((CloneF == nullptr) || (ClosureTy == nullptr)) {
+            return false;
+        }
+
+        if (CloneF->arg_empty()) {
+            return false;
+        }
+
+        bool Changed = false;
+        SmallVector<Instruction *, 8> ToErase;
+
+        for (BasicBlock &BB : *CloneF) {
+            for (Instruction &I : BB) {
+                auto *LI = dyn_cast<LoadInst>(&I);
+                if (LI == nullptr) {
+                    continue;
+                }
+
+                // We care only about loads from GEPs on the closure
+                auto *GEP = dyn_cast<GetElementPtrInst>(LI->getPointerOperand());
+                if (GEP == nullptr) {
+                    continue;
+                }
+
+                // With opaque pointers, the source element type is what tells us
+                // which struct we're indexing into.
+                if (GEP->getSourceElementType() != ClosureTy) {
+                    continue;
+                }
+
+                // Expect at least two indices: [0, FieldIndex]
+                if (GEP->getNumIndices() < 2) {
+                    continue;
+                }
+
+                auto IdxIt = GEP->idx_begin();
+                auto *Idx0 = dyn_cast<ConstantInt>(IdxIt->get());
+                auto *Idx1 = dyn_cast<ConstantInt>((++IdxIt)->get());
+
+                if ((Idx0 == nullptr) || (Idx1 == nullptr)) {
+                    continue;
+                }
+
+                if (Idx0->getSExtValue() != 0) {
+                    continue;
+                }
+
+                if (Idx1->getZExtValue() != Key.FieldIndex) {
+                    continue;
+                }
+
+                // This is a load from the captured field we care about.
+                Type *FieldTy = LI->getType();
+
+                if (!FieldTy->isIntegerTy()) {
+                    llvm::errs() << "[lambda-opt] Capture field " << Key.FieldIndex << " in lambda '"
+                                 << ClosureTy->getName() << "' is not an integer type; skipping specialization.\n";
+                    continue;
+                }
+
+                // Build constant with same bit-width as the field
+                auto *IntTy = cast<IntegerType>(FieldTy);
+                Constant *ConstVal = ConstantInt::get(IntTy, Prof.HotValue);
+
+                LI->replaceAllUsesWith(ConstVal);
+                ToErase.push_back(LI);
+                Changed = true;
+
+                llvm::errs() << "[lambda-opt] Specialized capture field " << Key.FieldIndex << " in clone '"
+                             << CloneF->getName() << "' with value " << Prof.HotValue << "\n";
+            }
+        }
+
+        // Clean up dead loads
+        for (Instruction *I : ToErase) {
+            I->eraseFromParent();
+        }
+
+        return Changed;
+    }
+
   public:
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
         // later we’ll probably make this configurable
         CaptureProfileMap Profiles = loadCaptureProfiles("../../logs/lambda_logs_lambda_profdata.txt");
 
-        // next phases (we’ll write later):
-        //   - find StructType* and operator() for each entry
-        //   - clone and specialize
-        //   - rewrite call sites
+        for (auto &[Key, Prof] : Profiles) {
 
-        return PreservedAnalyses::none(); // for now we’ll be mutating later
+            // 1. Find the closure StructType for this lambda.
+            StructType *CT = findClosureType(M, Key);
+            if (CT == nullptr) {
+                continue; // already logged
+            }
+
+            // 2. Find the original lambda operator().
+            Function *OriginalOp = findLambdaOperatorFunc(M, CT);
+            if (OriginalOp == nullptr) {
+                continue; // already logged
+            }
+
+            // 3. Clone the operator() into a hot specialization candidate.
+            Function *HotClone = cloneLambdaOperator(OriginalOp, Key, Prof);
+            if (HotClone == nullptr) {
+                continue;
+            }
+
+            // 4. In the hot clone, bake the capture field into a constant and
+            //    remove the corresponding loads.
+            bool Success = specializeCaptureInClone(HotClone, CT, Key, Prof);
+
+            if (!Success) {
+                // If we didn't manage to specialize anything, drop the clone to
+                // avoid cluttering the module with unused copies.
+                llvm::errs() << "[lambda-opt] No specialization performed in clone '" << HotClone->getName()
+                             << "', erasing it.\n";
+                HotClone->eraseFromParent();
+            }
+            else {
+                llvm::errs() << "[lambda-opt] Created hot operator clone '" << HotClone->getName() << "' for lambda '"
+                             << Key.Name << "', field " << Key.FieldIndex << " = " << Prof.HotValue << "\n";
+            }
+        }
+
+        // We are mutating the module (adding/removing functions), so we don't
+        // preserve analyses.
+        return PreservedAnalyses::none();
     }
 };
-
 } // namespace
