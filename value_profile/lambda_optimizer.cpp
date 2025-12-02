@@ -345,50 +345,261 @@ class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
         return Changed;
     }
 
+    // Find the store that writes the captured field for this call.
+    // Returns nullptr if we can't find a matching pattern in the same basic block.
+    static StoreInst *findCaptureStoreForCall(CallInst *CI, StructType *ClosureTy, const LambdaCaptureKey &Key) {
+        if (!CI || !ClosureTy) {
+            return nullptr;
+        }
+
+        BasicBlock *BB = CI->getParent();
+        if (!BB) {
+            return nullptr;
+        }
+
+        // First argument is the closure pointer ("this")
+        if (CI->arg_empty()) {
+            return nullptr;
+        }
+
+        Value *ThisArg = CI->getArgOperand(0);
+        Value *ThisBase = stripPointerCasts(ThisArg);
+
+        // Walk backwards from the call within the same basic block
+        for (auto It = BasicBlock::iterator(CI); It != BB->begin();) {
+            --It;
+            Instruction &I = *It;
+
+            auto *SI = dyn_cast<StoreInst>(&I);
+            if (!SI) {
+                continue;
+            }
+
+            auto *GEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());
+            if (!GEP) {
+                continue;
+            }
+
+            // We only care about GEPs indexing into the lambda closure struct.
+            if (GEP->getSourceElementType() != ClosureTy) {
+                continue;
+            }
+
+            // Check indices: expect [0, FieldIndex]
+            if (GEP->getNumIndices() < 2) {
+                continue;
+            }
+
+            auto IdxIt = GEP->idx_begin();
+            auto *Idx0 = dyn_cast<ConstantInt>(IdxIt->get());
+            auto *Idx1 = dyn_cast<ConstantInt>((++IdxIt)->get());
+
+            if (!Idx0 || !Idx1) {
+                continue;
+            }
+
+            if (Idx0->getSExtValue() != 0) {
+                continue;
+            }
+
+            if (Idx1->getZExtValue() != Key.FieldIndex) {
+                continue;
+            }
+
+            // Check that the GEP base ultimately comes from the "this" argument.
+            Value *GEPBase = stripPointerCasts(GEP->getPointerOperand());
+            if (GEPBase != ThisBase) {
+                continue;
+            }
+
+            // This looks like the capture store we want.
+            return SI;
+        }
+
+        return nullptr;
+    }
+
+    // For each direct call to OriginalOp, insert a guard:
+    //
+    //    if (capture == HotValue)
+    //       call HotClone(...)
+    //    else
+    //       call OriginalOp(...)
+    //
+    // and replace the original call with a PHI that merges the results.
+    //
+    // Returns true if any call sites were rewritten.
+    static bool specializeConstructionAndCall(Function *OriginalOp, Function *HotClone, StructType *ClosureTy,
+                                              const LambdaCaptureKey &Key, const CaptureProfile &Prof) {
+        if (!OriginalOp || !HotClone || !ClosureTy) {
+            return false;
+        }
+
+        bool Changed = false;
+        LLVMContext &Ctx = OriginalOp->getContext();
+
+        // Snapshot the call sites first so we don't trip over CFG edits.
+        SmallVector<CallInst *, 8> CallSites;
+        for (User *U : OriginalOp->users()) {
+            if (auto *CI = dyn_cast<CallInst>(U)) {
+                if (CI->getCalledFunction() == OriginalOp) {
+                    CallSites.push_back(CI);
+                }
+            }
+        }
+
+        for (CallInst *CI : CallSites) {
+            // Find the capture store for this call.
+            StoreInst *CaptureStore = findCaptureStoreForCall(CI, ClosureTy, Key);
+            if (!CaptureStore) {
+                llvm::errs() << "[lambda-opt] Could not find capture store for call to '" << OriginalOp->getName()
+                             << "'; skipping this call site.\n";
+                continue;
+            }
+
+            Value *CapturedVal = CaptureStore->getValueOperand();
+            auto *IntTy = dyn_cast<IntegerType>(CapturedVal->getType());
+            if (!IntTy) {
+                llvm::errs() << "[lambda-opt] Capture value at call site is not an integer; skipping.\n";
+                continue;
+            }
+
+            // Build constant HotValue with same bit-width as the capture.
+            APInt HotAP(IntTy->getBitWidth(), static_cast<uint64_t>(Prof.HotValue),
+                        /*isSigned=*/true);
+            Constant *HotConst = ConstantInt::get(IntTy, HotAP);
+
+            // Split the basic block at the call.
+            BasicBlock *OrigBB = CI->getParent();
+            BasicBlock *MergeBB = OrigBB->splitBasicBlock(CI, "lambda.merge");
+
+            // OrigBB now ends with an unconditional branch to MergeBB; we replace it.
+            Instruction *OldTerm = OrigBB->getTerminator();
+
+            // Create the comparison in OrigBB, right before the old terminator.
+            IRBuilder<> CmpBuilder(OldTerm);
+            Value *IsHot = CmpBuilder.CreateICmpEQ(CapturedVal, HotConst, "lambda.is_hot");
+
+            // Create hot and cold blocks, inserted before MergeBB.
+            Function *ParentF = OrigBB->getParent();
+            auto *HotBB = BasicBlock::Create(Ctx, "lambda.hot", ParentF, MergeBB);
+            auto *ColdBB = BasicBlock::Create(Ctx, "lambda.cold", ParentF, MergeBB);
+
+            // Remove the store from OrigBB and place it at the beginning of ColdBB.
+            CaptureStore->removeFromParent();
+            CaptureStore->insertBefore(&*ColdBB->begin());
+
+            // Now the hot path has *no store*.
+            // The cold path still performs the store before calling the original operator.
+
+            // Replace the unconditional branch with a conditional branch.
+            OldTerm->eraseFromParent();
+            IRBuilder<> BrBuilder(OrigBB);
+            BrBuilder.SetInsertPoint(OrigBB);
+            BrBuilder.CreateCondBr(IsHot, HotBB, ColdBB);
+
+            // Rebuild the argument list for the calls.
+            SmallVector<Value *, 8> Args;
+            Args.reserve(CI->arg_size());
+            for (unsigned i = 0; i < CI->arg_size(); ++i) {
+                Args.push_back(CI->getArgOperand(i));
+            }
+
+            Type *RetTy = OriginalOp->getReturnType();
+            Value *HotCall = nullptr;
+            Value *ColdCall = nullptr;
+
+            // Emit hot path: call the specialized clone, then branch to merge.
+            {
+                IRBuilder<> HotBuilder(HotBB);
+                if (RetTy->isVoidTy()) {
+                    HotBuilder.CreateCall(HotClone, Args);
+                    HotBuilder.CreateBr(MergeBB);
+                }
+                else {
+                    HotCall = HotBuilder.CreateCall(HotClone, Args, "lambda.call.hot");
+                    HotBuilder.CreateBr(MergeBB);
+                }
+            }
+
+            // Emit cold path: call the original operator, then branch to merge.
+            {
+                IRBuilder<> ColdBuilder(ColdBB);
+                if (RetTy->isVoidTy()) {
+                    ColdBuilder.CreateCall(OriginalOp, Args);
+                    ColdBuilder.CreateBr(MergeBB);
+                }
+                else {
+                    ColdCall = ColdBuilder.CreateCall(OriginalOp, Args, "lambda.call.cold");
+                    ColdBuilder.CreateBr(MergeBB);
+                }
+            }
+
+            if (!RetTy->isVoidTy()) {
+                // In MergeBB, replace the old call with a PHI that selects hot vs cold.
+                IRBuilder<> MergeBuilder(MergeBB);
+                MergeBuilder.SetInsertPoint(&*MergeBB->begin());
+
+                PHINode *PHI = MergeBuilder.CreatePHI(RetTy, 2, "lambda.call.sel");
+                PHI->addIncoming(HotCall, HotBB);
+                PHI->addIncoming(ColdCall, ColdBB);
+
+                CI->replaceAllUsesWith(PHI);
+            }
+
+            // Erase the original direct call in MergeBB; we now have hot/cold calls.
+            CI->eraseFromParent();
+
+            llvm::errs() << "[lambda-opt] Rewrote call site of '" << OriginalOp->getName()
+                         << "' to guard on capture == " << Prof.HotValue << "\n";
+
+            Changed = true;
+        }
+
+        return Changed;
+    }
+
   public:
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
-        // later we’ll probably make this configurable
         CaptureProfileMap Profiles = loadCaptureProfiles("../../logs/lambda_logs_lambda_profdata.txt");
 
         for (auto &[Key, Prof] : Profiles) {
 
-            // 1. Find the closure StructType for this lambda.
             StructType *CT = findClosureType(M, Key);
-            if (CT == nullptr) {
-                continue; // already logged
-            }
-
-            // 2. Find the original lambda operator().
-            Function *OriginalOp = findLambdaOperatorFunc(M, CT);
-            if (OriginalOp == nullptr) {
-                continue; // already logged
-            }
-
-            // 3. Clone the operator() into a hot specialization candidate.
-            Function *HotClone = cloneLambdaOperator(OriginalOp, Key, Prof);
-            if (HotClone == nullptr) {
+            if (!CT) {
                 continue;
             }
 
-            // 4. In the hot clone, bake the capture field into a constant and
-            //    remove the corresponding loads.
-            bool Success = specializeCaptureInClone(HotClone, CT, Key, Prof);
+            Function *OriginalOp = findLambdaOperatorFunc(M, CT);
+            if (!OriginalOp) {
+                continue;
+            }
 
-            if (!Success) {
-                // If we didn't manage to specialize anything, drop the clone to
-                // avoid cluttering the module with unused copies.
-                llvm::errs() << "[lambda-opt] No specialization performed in clone '" << HotClone->getName()
+            Function *HotClone = cloneLambdaOperator(OriginalOp, Key, Prof);
+            if (!HotClone) {
+                continue;
+            }
+
+            bool SpecializedBody = specializeCaptureInClone(HotClone, CT, Key, Prof);
+
+            if (!SpecializedBody) {
+                llvm::errs() << "[lambda-opt] No specialization in clone '" << HotClone->getName()
                              << "', erasing it.\n";
                 HotClone->eraseFromParent();
+                continue;
             }
-            else {
-                llvm::errs() << "[lambda-opt] Created hot operator clone '" << HotClone->getName() << "' for lambda '"
-                             << Key.Name << "', field " << Key.FieldIndex << " = " << Prof.HotValue << "\n";
+
+            llvm::errs() << "[lambda-opt] Created hot operator clone '" << HotClone->getName() << "' for lambda '"
+                         << Key.Name << "', field " << Key.FieldIndex << " = " << Prof.HotValue << "\n";
+
+            // NEW: rewrite call sites to branch between OriginalOp and HotClone.
+            bool RewroteCalls = specializeConstructionAndCall(OriginalOp, HotClone, CT, Key, Prof);
+            if (!RewroteCalls) {
+                llvm::errs() << "[lambda-opt] No call sites rewritten for '" << OriginalOp->getName()
+                             << "'; hot clone may remain unused.\n";
             }
         }
 
-        // We are mutating the module (adding/removing functions), so we don't
-        // preserve analyses.
         return PreservedAnalyses::none();
     }
 };
