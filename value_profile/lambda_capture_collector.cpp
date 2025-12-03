@@ -113,21 +113,21 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
     /// Only supports integer captures (i32 or i64). Returns nullptr otherwise.
     /// Precondition: SI is a lambda capture store (checked by caller).
     static Value *getCapturedValue(StoreInst *SI) {
-        if (SI == nullptr) {
+        if (!SI)
             return nullptr;
-        }
 
         Value *V = SI->getValueOperand();
-        if (V == nullptr) {
+        if (!V)
             return nullptr;
-        }
 
         Type *Ty = V->getType();
-        if (!Ty->isIntegerTy(32) && !Ty->isIntegerTy(64)) {
+
+        // Accept any integer: i1, i8, i16, i32, i64, i128, whatever
+        if (!Ty->isIntegerTy()) {
             return nullptr;
         }
 
-        return V; // valid integer capture
+        return V;
     }
 
     /// Extract the field index being written in a lambda capture store.
@@ -169,6 +169,12 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
     void handleCaptureStore(Function &F, StoreInst *SI, Module &module, LLVMContext &context) {
         auto *ST = getLambdaStruct(SI);
         auto *value = getCapturedValue(SI);
+
+        if (!value) {
+            errs() << "  Value: <unsupported capture type, skipping>\n";
+            return;
+        }
+
         int field = getCaptureFieldIndex(SI);
 
         errs() << "[lambda] capture in function " << F.getName() << "\n";

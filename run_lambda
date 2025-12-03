@@ -65,5 +65,22 @@ cd $(dirname $SRC_FILE)
 SELECTED_PASS=lambda_optimizer
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_lambda_profiled.bc >/dev/null
 
-# Generate binary executable after FPLICM: Optimized code
+##############################################
+#            RUN O2
+##############################################
+
+# regular O2
+opt -S -passes='default<O2>' ${FILENAME}.bc -o ${FILENAME}.O2.bc
+
+# O2 with our pass
+opt -S -passes='default<O2>' ${FILENAME}.value_lambda_profiled.bc -o ${FILENAME}.value_lambda_profiled.O2.bc
+
+##############################################
+#            GENERATE EXECUTABLES
+##############################################
+
 clang++ -fprofile-instr-generate ${FILENAME}.value_lambda_profiled.bc -o ${FILENAME}_value_lambda_profiled
+
+clang++ -fprofile-instr-generate ${FILENAME}.value_lambda_profiled.O2.bc -o ${FILENAME}_value_lambda_profiled.O2
+
+clang++ -fprofile-instr-generate ${FILENAME}.O2.bc -o ${FILENAME}.O2

@@ -299,6 +299,72 @@ static bool specializeCaptureInClone(Function *CloneF, StructType *ClosureTy, co
     return Changed;
 }
 
+// Clone an arbitrary function (e.g., the std::function helper / ctor / invoker)
+// and specialize loads from the closure field to the hot constant.
+//
+// We name it based on the original function name, closure type, field index,
+// and hot value so we can reuse the clone if we see multiple call sites.
+static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *ClosureTy, const LambdaCaptureKey &Key,
+                                              const CaptureProfile &Prof) {
+    if (!OrigF || OrigF->isDeclaration())
+        return nullptr;
+
+    Module *M = OrigF->getParent();
+    if (!M)
+        return nullptr;
+
+    // Deterministic name so we can reuse a clone if it already exists.
+    std::string NewName = OrigF->getName().str();
+    NewName += ".lambda_hot.";
+    NewName += ClosureTy->getName().str();
+    NewName += ".field";
+    NewName += std::to_string(Key.FieldIndex);
+    NewName += ".value";
+    NewName += std::to_string(Prof.HotValue);
+
+    if (Function *Existing = M->getFunction(NewName)) {
+        return Existing;
+    }
+
+    FunctionType *FTy = OrigF->getFunctionType();
+    Function *NewF = Function::Create(FTy, OrigF->getLinkage(), NewName, M);
+
+    // Preserve calling convention and attributes.
+    NewF->setCallingConv(OrigF->getCallingConv());
+    NewF->copyAttributesFrom(OrigF);
+    NewF->removeFnAttr(Attribute::NoInline);
+    NewF->addFnAttr(Attribute::AlwaysInline);
+
+    ValueToValueMapTy VMap;
+    {
+        auto A = OrigF->arg_begin();
+        auto B = NewF->arg_begin();
+        for (; A != OrigF->arg_end(); ++A, ++B) {
+            B->setName(A->getName());
+            VMap[&*A] = &*B;
+        }
+    }
+
+    SmallVector<ReturnInst *, 8> Returns;
+    CloneFunctionInto(NewF, OrigF, VMap, CloneFunctionChangeType::LocalChangesOnly, Returns);
+
+    // Now specialize loads from closure.field[Key.FieldIndex] to Prof.HotValue.
+    bool Specialized = specializeCaptureInClone(NewF, ClosureTy, Key, Prof);
+    if (!Specialized) {
+        llvm::errs() << "[lambda-opt] cloneAndSpecializeForCapture: no "
+                        "matching loads in clone '"
+                     << NewF->getName() << "'; erasing.\n";
+        NewF->eraseFromParent();
+        return nullptr;
+    }
+
+    llvm::errs() << "[lambda-opt] Escaping: created hot specialization '" << NewF->getName() << "' from '"
+                 << OrigF->getName() << "' for lambda '" << Key.Name << "', field " << Key.FieldIndex << " = "
+                 << Prof.HotValue << "\n";
+
+    return NewF;
+}
+
 // Backwards-scan to find store to the capture field in the same block.
 static StoreInst *findCaptureStoreForCall(CallInst *CI, StructType *ClosureTy, const LambdaCaptureKey &Key) {
     if (!CI || !ClosureTy)
@@ -573,6 +639,19 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
         return false;
     }
 
+    // 0) We need the original callee and a hot specialization of it.
+    Function *OrigCallee = CI->getCalledFunction();
+    if (!OrigCallee) {
+        return false;
+    }
+
+    Function *HotCallee = cloneAndSpecializeForCapture(OrigCallee, ClosureTy, Key, Prof);
+    if (!HotCallee) {
+        // If we can't build a hot specialization, just bail out and leave this
+        // call untouched.
+        return false;
+    }
+
     // 1) Find ctor argument that is zext(load(closure.field[fieldIndex]))
     int CaptureArgIndex = -1;
     ZExtInst *ZExt = nullptr;
@@ -685,20 +764,20 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
     Value *ColdCall = nullptr;
     {
         IRBuilder<> B(ColdBB);
-        ColdCall = B.CreateCall(CI->getCalledFunction(), ColdArgs, CI->getName() + ".cold");
+        ColdCall = B.CreateCall(OrigCallee, ColdArgs, CI->getName() + ".cold");
         B.CreateBr(MergeBB);
     }
 
     // 6) Hot path:
-    //    - overwrite closure field with HotValue (so lambda "sees" 10)
-    //    - call ctor with HotValue argument
+    //    - overwrite closure field with HotValue (so any remaining loads see 10)
+    //    - call the *specialized* callee, which also has the hot value baked in
     Value *HotCall = nullptr;
     {
         IRBuilder<> B(HotBB);
         // Reuse the same field pointer as the store
         Value *CapturePtr = Store->getPointerOperand();
         B.CreateStore(HotCapture, CapturePtr);
-        HotCall = B.CreateCall(CI->getCalledFunction(), HotArgs, CI->getName() + ".hot");
+        HotCall = B.CreateCall(HotCallee, HotArgs, CI->getName() + ".hot");
         B.CreateBr(MergeBB);
     }
 
@@ -714,9 +793,10 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
 
     CI->eraseFromParent();
 
-    llvm::errs() << "[lambda-opt] Escaping: branched std::function construction "
-                    "for closure '"
-                 << ClosureTy->getName() << "', field " << Key.FieldIndex << " on value == " << Prof.HotValue << "\n";
+    llvm::errs() << "[lambda-opt] Escaping: branched std::function construction for "
+                    "closure '"
+                 << ClosureTy->getName() << "', field " << Key.FieldIndex << " on value == " << Prof.HotValue
+                 << " using specialized callee '" << HotCallee->getName() << "'\n";
 
     return true;
 }
@@ -763,7 +843,7 @@ class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
         CaptureProfileMap Profiles = loadCaptureProfiles("../../logs/lambda_logs_lambda_profdata.txt");
 
-        // DirectLambdaSpecializer (Profiles).run(M);
+        DirectLambdaSpecializer(Profiles).run(M);
         EscapingLambdaSpecializer(Profiles).run(M);
 
         return PreservedAnalyses::none();
