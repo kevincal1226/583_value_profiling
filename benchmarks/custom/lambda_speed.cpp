@@ -21,7 +21,7 @@ NormFunc make_norm(bool use_z) {
 
 int main() {
     constexpr int N_FUNCS = 1'000'000;
-    constexpr int N_CALLS = 3; // calls per function
+    constexpr int N_CALLS = 300; // calls per function
 
     std::vector<NormFunc> funcs;
     funcs.reserve(N_FUNCS);

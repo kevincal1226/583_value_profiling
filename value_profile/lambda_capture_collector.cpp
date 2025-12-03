@@ -110,24 +110,11 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
     }
 
     /// Extract the captured value from a lambda capture store.
-    /// Only supports integer captures (i32 or i64). Returns nullptr otherwise.
     /// Precondition: SI is a lambda capture store (checked by caller).
     static Value *getCapturedValue(StoreInst *SI) {
         if (!SI)
             return nullptr;
-
-        Value *V = SI->getValueOperand();
-        if (!V)
-            return nullptr;
-
-        Type *Ty = V->getType();
-
-        // Accept any integer: i1, i8, i16, i32, i64, i128, whatever
-        if (!Ty->isIntegerTy()) {
-            return nullptr;
-        }
-
-        return V;
+        return SI->getValueOperand();
     }
 
     /// Extract the field index being written in a lambda capture store.
@@ -168,61 +155,89 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
 
     void handleCaptureStore(Function &F, StoreInst *SI, Module &module, LLVMContext &context) {
         auto *ST = getLambdaStruct(SI);
-        auto *value = getCapturedValue(SI);
-
-        if (!value) {
-            errs() << "  Value: <unsupported capture type, skipping>\n";
-            return;
-        }
-
+        auto *value = SI->getValueOperand(); // no type filter here
         int field = getCaptureFieldIndex(SI);
 
+        if (!value) {
+
+            errs() << "[lambda] capture does not have value" << F.getName() << "\n";
+        }
+
+        // Debug log to stderr
         errs() << "[lambda] capture in function " << F.getName() << "\n";
         errs() << "  Struct: " << ST->getName() << "\n";
         errs() << "  Field: " << field << "\n";
-        errs() << "  Value: ";
+        errs() << "  Value IR: ";
         value->print(errs());
         errs() << "\n";
 
-        IRBuilder<> builder{SI};
-
+        IRBuilder<> builder(SI);
+        Type *ty = value->getType();
         const std::string lambda_name = ST->getName().str();
 
-        Value *int_arg = value;
-        Type *ty = int_arg->getType();
+        // Load FILE*
+        Value *file_ptr = builder.CreateLoad(builder.getPtrTy(), global_fileptr);
+        Value *field_val = builder.getInt32(field);
 
-        if (!ty->isIntegerTy()) {
-            errs() << "Expected integer capture for printing\n";
+        // Helpers
+        auto fprintfFunc = get_or_insert_fprintf_func(module);
+
+        // --- Case 1: Integer captures -----------------------
+        if (ty->isIntegerTy()) {
+            unsigned bw = ty->getIntegerBitWidth();
+            Value *val = value;
+
+            if (bw < 64)
+                val = builder.CreateZExt(val, builder.getInt64Ty());
+            else if (bw > 64)
+                val = builder.CreateTrunc(val, builder.getInt64Ty());
+
+            auto *fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " %d %ld\n");
+            Value *fmt_ptr = builder.CreateBitCast(fmt, builder.getPtrTy());
+
+            builder.CreateCall(fprintfFunc, {file_ptr, fmt_ptr, field_val, val});
             return;
         }
 
-        // Promote anything smaller than 64 bits
-        if (ty->getIntegerBitWidth() < 64) {
-            int_arg = builder.CreateZExt(int_arg, builder.getInt64Ty());
-        }
-        else if (ty->getIntegerBitWidth() > 64) {
-            // Avoid oversized integer UB — truncate (or reconsider formatting)
-            int_arg = builder.CreateTrunc(int_arg, builder.getInt64Ty());
+        // --- Case 2: Floating captures (float, double) ------
+        if (ty->isFloatingPointTy()) {
+            Value *dbl = value;
+            if (ty->isFloatTy())
+                dbl = builder.CreateFPExt(dbl, builder.getDoubleTy()); // promote float → double
+
+            auto *fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " %d %f\n");
+            Value *fmt_ptr = builder.CreateBitCast(fmt, builder.getPtrTy());
+
+            builder.CreateCall(fprintfFunc, {file_ptr, fmt_ptr, field_val, dbl});
+            return;
         }
 
-        auto *fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " %d %ld\n");
+        // --- Case 3: Pointer captures → print %p ------------
+        if (ty->isPointerTy()) {
+            Value *ptrInt = builder.CreatePtrToInt(value, builder.getInt64Ty());
 
+            auto *fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " %d %p\n");
+            Value *fmt_ptr = builder.CreateBitCast(fmt, builder.getPtrTy());
+
+            builder.CreateCall(fprintfFunc, {file_ptr, fmt_ptr, field_val, ptrInt});
+            return;
+        }
+
+        // --- Case 4: Unknown scalar → raw bits as hex -------
+        unsigned bits = ty->getScalarSizeInBits();
+        if (bits == 0 || bits > 64) {
+            errs() << "  Unsupported non-scalar capture type, skipping\n";
+            return;
+        }
+
+        Value *raw = builder.CreateBitCast(value, builder.getIntNTy(bits));
+        if (bits < 64)
+            raw = builder.CreateZExt(raw, builder.getInt64Ty());
+
+        auto *fmt = make_fmt(module, context, "LAMBDA " + lambda_name + " %d 0x%lX\n");
         Value *fmt_ptr = builder.CreateBitCast(fmt, builder.getPtrTy());
-        Value *file_ptr = builder.CreateLoad(builder.getPtrTy(), global_fileptr);
 
-        // field index is a normal C++ int → make LLVM i32
-        Value *field_val = builder.getInt32(field);
-
-        // captured value: print as %ld (i64)
-        Value *long_val = int_arg; // already zext/trunc to i64 above
-
-        builder.CreateCall(get_or_insert_fprintf_func(module),
-                           {
-                               file_ptr,  // FILE*
-                               fmt_ptr,   // const char*
-                               field_val, // %d
-                               long_val   // %ld
-                           });
+        builder.CreateCall(fprintfFunc, {file_ptr, fmt_ptr, field_val, raw});
     }
 
     static auto make_fmt(Module &module, LLVMContext &context, std::string const &str) -> GlobalVariable * {

@@ -16,7 +16,7 @@ logfile: str = sys.argv[1]
 # func -> var -> val -> cnt
 tnv_table = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 
-lambda_construction_count = defaultdict(int)
+lambda_construction_count = defaultdict(lambda: defaultdict(int))
 
 with open(logfile) as f:
     lines = f.readlines()
@@ -27,7 +27,7 @@ for line in lines:
 
     _, lambda_name, capture_arg, value = line.strip().split(" ")
 
-    lambda_construction_count[lambda_name] += 1
+    lambda_construction_count[lambda_name][capture_arg] += 1
 
     tnv_table[lambda_name][capture_arg][value] += 1
 
@@ -36,7 +36,8 @@ print(tnv_table.keys())
 
 outfile = logfile.removesuffix(".txt") + "_lambda_profdata.txt"
 
-Path(outfile).unlink()
+if Path(outfile).exists():
+    Path(outfile).unlink()
 
 
 with open(outfile, "w") as f:
@@ -44,5 +45,5 @@ with open(outfile, "w") as f:
         for var, val_map in var_map.items():
             for val, cnt in sorted(val_map.items(), key=lambda b: -b[1]):
                 f.write(
-                    f"{lambda_name},{var},{val},{cnt},{cnt / lambda_construction_count[lambda_name]}\n"
+                    f"{lambda_name},{var},{val},{cnt},{cnt / lambda_construction_count[lambda_name][var]}\n"
                 )
