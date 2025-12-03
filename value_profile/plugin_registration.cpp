@@ -39,7 +39,7 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                 // Register MODULE PASS: lambda_capture_collector
                 PB.registerPipelineParsingCallback(
                     [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
-                        if (Name == "lambda_capture_collector") {
+                        if (Name == "lambda_optimizer") {
                             MPM.addPass(lambdaopt::LambdaOptimizer());
                             return true;
                         }

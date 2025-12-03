@@ -199,9 +199,15 @@ static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *Closu
     // Now specialize loads from closure.field[Key.FieldIndex] to Prof.HotValue.
     bool Specialized = specializeCaptureInClone(NewF, ClosureTy, Key, Prof);
     if (!Specialized) {
-        errs() << "[lambda-opt] cloneAndSpecializeForCapture: no "
-                  "matching loads in clone '"
-               << NewF->getName() << "'; erasing.\n";
+        std::string Name = NewF->getName().str();
+        if (Name.find("std::") == std::string::npos && Name.find("__clang") == std::string::npos &&
+            Name.find("__cxxabiv1") == std::string::npos && Name.find("llvm.") == std::string::npos &&
+            Name.find("allocator") == std::string::npos &&
+            Name.find("_ZNSt") == std::string::npos) { // demangled std:: prefix
+            llvm::errs() << "[lambda-opt] cloneAndSpecializeForCapture: NO MATCHING LOADS — erasing unused clone: "
+                         << Name << "\n";
+        }
+
         NewF->eraseFromParent();
         return nullptr;
     }
