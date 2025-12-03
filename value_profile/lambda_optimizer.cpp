@@ -119,6 +119,34 @@ CaptureProfileMap loadCaptureProfiles(const std::string &Path) {
 
 // ================= Shared helpers =================
 
+static bool isProbablyUserCode(const Function &F) {
+    if (F.isDeclaration())
+        return false;
+
+    std::string Mangled = F.getName().str();
+    std::string Demangled = llvm::demangle(Mangled);
+
+    // Very dumb but effective: skip obvious library / runtime code.
+    if (Demangled.find("std::") != std::string::npos)
+        return false;
+    if (Demangled.find("__gnu_cxx::") != std::string::npos)
+        return false;
+    if (Demangled.find("llvm::") != std::string::npos)
+        return false;
+    if (Demangled.find("__clang") != std::string::npos)
+        return false;
+    if (Demangled.find("__cxxabiv1") != std::string::npos)
+        return false;
+
+    // You can also require *something* that looks like your code:
+    // e.g. your main file name, namespace, etc.
+    // if (Demangled.find("main") == std::string::npos &&
+    //     Demangled.find("MyProject") == std::string::npos)
+    //   return false;
+
+    return true;
+}
+
 static StructType *findClosureType(const Module &M, const LambdaCaptureKey &Key) {
     const std::string &TargetName = Key.Name;
 
@@ -275,21 +303,30 @@ static bool specializeCaptureInClone(Function *CloneF, StructType *ClosureTy, co
                 continue;
 
             Type *FieldTy = LI->getType();
-            if (!FieldTy->isIntegerTy()) {
+            Constant *ConstVal = nullptr;
+
+            // --- Support integer ---
+            if (auto *IntTy = dyn_cast<IntegerType>(FieldTy)) {
+                ConstVal = ConstantInt::get(IntTy, Prof.HotValue,
+                                            /*isSigned*/ true);
+            }
+            // --- Support double (or other FP type) ---
+            else if (FieldTy->isFloatingPointTy()) {
+                ConstVal = ConstantFP::get(FieldTy, static_cast<double>(Prof.HotValue));
+            }
+            else {
                 llvm::errs() << "[lambda-opt] Capture field " << Key.FieldIndex << " in lambda '"
-                             << ClosureTy->getName() << "' is not integer; skipping.\n";
+                             << ClosureTy->getName() << "' is not int/double; skipping.\n";
                 continue;
             }
-
-            auto *IntTy = cast<IntegerType>(FieldTy);
-            Constant *ConstVal = ConstantInt::get(IntTy, Prof.HotValue);
 
             LI->replaceAllUsesWith(ConstVal);
             ToErase.push_back(LI);
             Changed = true;
 
             llvm::errs() << "[lambda-opt] Specialized capture field " << Key.FieldIndex << " in clone '"
-                         << CloneF->getName() << "' with value " << Prof.HotValue << "\n";
+                         << CloneF->getName() << "' with value " << Prof.HotValue << " ("
+                         << (FieldTy->isIntegerTy() ? "int" : "double") << ")\n";
         }
     }
 
@@ -419,7 +456,54 @@ static StoreInst *findCaptureStoreForCall(CallInst *CI, StructType *ClosureTy, c
     return nullptr;
 }
 
-// Direct-call specialization: if (capture==HotValue) call HotClone() else OriginalOp().
+static std::vector<unsigned> getAllCaptureFields(StructType *ClosureTy) {
+    std::vector<unsigned> fields;
+    if (!ClosureTy)
+        return fields;
+
+    // Skip the vptr / magic LLVM indices; real captures start at field 0 or 1
+    unsigned Num = ClosureTy->getNumElements();
+    for (unsigned i = 0; i < Num; ++i) {
+        Type *T = ClosureTy->getElementType(i);
+        if (T->isIntegerTy() || T->isFloatingPointTy())
+            fields.push_back(i);
+    }
+    return fields;
+}
+
+static StoreInst *findStoreRecursive(Value *Ptr, BasicBlock *StartBB, Instruction *Before,
+                                     std::set<BasicBlock *> &Visited) {
+    if (!StartBB || Visited.count(StartBB))
+        return nullptr;
+    Visited.insert(StartBB);
+
+    bool CheckBefore = (Before && Before->getParent() == StartBB);
+
+    for (auto it = StartBB->rbegin(); it != StartBB->rend(); ++it) {
+        Instruction &I = *it;
+        if (CheckBefore && &I == Before)
+            break;
+
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            if (stripPointerCasts(SI->getPointerOperand()) == stripPointerCasts(Ptr)) {
+                return SI;
+            }
+        }
+    }
+
+    for (BasicBlock *Pred : predecessors(StartBB)) {
+        if (StoreInst *S = findStoreRecursive(Ptr, Pred, nullptr, Visited))
+            return S;
+    }
+
+    return nullptr;
+}
+
+// Direct-call specialization: if (capture == HotValue) call HotClone() else OriginalOp().
+//
+// We only specialize a single capture field given by Key.FieldIndex,
+// but this works fine even if the closure has multiple captures in the
+// struct; we just ignore the others here.
 static bool specializeConstructionAndCall(Function *OriginalOp, Function *HotClone, StructType *ClosureTy,
                                           const LambdaCaptureKey &Key, const CaptureProfile &Prof) {
     if (!OriginalOp || !HotClone || !ClosureTy)
@@ -428,6 +512,7 @@ static bool specializeConstructionAndCall(Function *OriginalOp, Function *HotClo
     bool Changed = false;
     LLVMContext &Ctx = OriginalOp->getContext();
 
+    // Collect all direct call sites to OriginalOp (ignore indirect calls etc.)
     SmallVector<CallInst *, 8> CallSites;
     for (User *U : OriginalOp->users()) {
         if (auto *CI = dyn_cast<CallInst>(U)) {
@@ -437,44 +522,81 @@ static bool specializeConstructionAndCall(Function *OriginalOp, Function *HotClo
     }
 
     for (CallInst *CI : CallSites) {
-        StoreInst *CaptureStore = findCaptureStoreForCall(CI, ClosureTy, Key);
-        if (!CaptureStore) {
-            llvm::errs() << "[lambda-opt] Could not find capture store for call "
-                            "to '"
-                         << OriginalOp->getName() << "'; skipping.\n";
+        if (CI->arg_empty()) {
+            // We expect the first argument to be the lambda "this" pointer.
             continue;
         }
 
-        Value *CapturedVal = CaptureStore->getValueOperand();
-        auto *IntTy = dyn_cast<IntegerType>(CapturedVal->getType());
-        if (!IntTy) {
-            llvm::errs() << "[lambda-opt] Capture value at call site is not "
-                            "integer; skipping.\n";
+        // 1) Get the closure pointer ("this") and strip bitcasts etc.
+        Value *ThisArg = CI->getArgOperand(0);
+        Value *ThisBase = stripPointerCasts(ThisArg);
+
+        // 2) Build a GEP to the specific capture field we’re specializing.
+        if (Key.FieldIndex >= ClosureTy->getNumElements()) {
+            llvm::errs() << "[lambda-opt] Field index " << Key.FieldIndex << " out of range for closure '"
+                         << ClosureTy->getName() << "'; skipping call site.\n";
             continue;
         }
 
-        APInt HotAP(IntTy->getBitWidth(), static_cast<uint64_t>(Prof.HotValue),
-                    /*isSigned=*/true);
-        Constant *HotConst = ConstantInt::get(IntTy, HotAP);
+        Type *FieldTy = ClosureTy->getElementType(Key.FieldIndex);
 
+        IRBuilder<> BeforeCall(CI);
+        Value *FieldPtr = BeforeCall.CreateStructGEP(ClosureTy,             // struct type
+                                                     ThisBase,              // pointer to closure
+                                                     Key.FieldIndex,        // field index
+                                                     "lambda.capture.ptr"); // name
+
+        // Load the capture value *at* the call site.
+        LoadInst *Load = BeforeCall.CreateLoad(FieldTy, FieldPtr, "lambda.capture");
+
+        Value *CapturedVal = Load;
+
+        // 3) Build the "hot" constant of the correct type.
+        Value *HotConst = nullptr;
+        if (auto *IntTy = dyn_cast<IntegerType>(FieldTy)) {
+            APInt HotAP(IntTy->getBitWidth(), static_cast<uint64_t>(Prof.HotValue),
+                        /*isSigned=*/true);
+            HotConst = ConstantInt::get(IntTy, HotAP);
+        }
+        else if (FieldTy->isFloatingPointTy()) {
+            HotConst = ConstantFP::get(FieldTy, static_cast<double>(Prof.HotValue));
+        }
+        else {
+            llvm::errs() << "[lambda-opt] Capture field " << Key.FieldIndex << " in closure '" << ClosureTy->getName()
+                         << "' is neither int nor FP; skipping call site.\n";
+            continue;
+        }
+
+        // 4) Split block at the call instruction.
         BasicBlock *OrigBB = CI->getParent();
         BasicBlock *MergeBB = OrigBB->splitBasicBlock(CI, "lambda.merge");
 
+        // The split leaves a dummy unconditional branch at the end of OrigBB.
         Instruction *OldTerm = OrigBB->getTerminator();
-        IRBuilder<> CmpBuilder(OldTerm);
-        Value *IsHot = CmpBuilder.CreateICmpEQ(CapturedVal, HotConst, "lambda.is_hot");
 
+        // 5) Build comparison (int: icmp, double: fcmp).
+        IRBuilder<> CmpBuilder(OldTerm);
+        Value *IsHot = nullptr;
+
+        if (FieldTy->isIntegerTy()) {
+            IsHot = CmpBuilder.CreateICmpEQ(CapturedVal, HotConst, "lambda.is_hot");
+        }
+        else { // floating point
+            // Ordered equal: true if both are numbers and equal.
+            IsHot = CmpBuilder.CreateFCmpOEQ(CapturedVal, HotConst, "lambda.is_hot");
+        }
+
+        // 6) Create hot and cold blocks.
         Function *ParentF = OrigBB->getParent();
         auto *HotBB = BasicBlock::Create(Ctx, "lambda.hot", ParentF, MergeBB);
         auto *ColdBB = BasicBlock::Create(Ctx, "lambda.cold", ParentF, MergeBB);
 
-        CaptureStore->removeFromParent();
-        CaptureStore->insertBefore(&*ColdBB->begin());
-
+        // Replace the dummy branch with a conditional branch.
         OldTerm->eraseFromParent();
         IRBuilder<> BrBuilder(OrigBB);
         BrBuilder.CreateCondBr(IsHot, HotBB, ColdBB);
 
+        // 7) Prepare argument list for both calls.
         SmallVector<Value *, 8> Args;
         Args.reserve(CI->arg_size());
         for (unsigned i = 0; i < CI->arg_size(); ++i)
@@ -484,6 +606,7 @@ static bool specializeConstructionAndCall(Function *OriginalOp, Function *HotClo
         Value *HotCall = nullptr;
         Value *ColdCall = nullptr;
 
+        // Hot path: call the specialized clone.
         {
             IRBuilder<> HotBuilder(HotBB);
             if (RetTy->isVoidTy()) {
@@ -496,6 +619,7 @@ static bool specializeConstructionAndCall(Function *OriginalOp, Function *HotClo
             }
         }
 
+        // Cold path: call the original operator().
         {
             IRBuilder<> ColdBuilder(ColdBB);
             if (RetTy->isVoidTy()) {
@@ -508,6 +632,7 @@ static bool specializeConstructionAndCall(Function *OriginalOp, Function *HotClo
             }
         }
 
+        // 8) If the call returns a value, merge with a PHI in MergeBB.
         if (!RetTy->isVoidTy()) {
             IRBuilder<> MergeBuilder(MergeBB);
             MergeBuilder.SetInsertPoint(&*MergeBB->begin());
@@ -515,20 +640,22 @@ static bool specializeConstructionAndCall(Function *OriginalOp, Function *HotClo
             PHINode *PHI = MergeBuilder.CreatePHI(RetTy, 2, "lambda.call.sel");
             PHI->addIncoming(HotCall, HotBB);
             PHI->addIncoming(ColdCall, ColdBB);
+
             CI->replaceAllUsesWith(PHI);
         }
 
+        // 9) Remove the original call.
         CI->eraseFromParent();
 
-        llvm::errs() << "[lambda-opt] Rewrote call site of '" << OriginalOp->getName()
-                     << "' to guard on capture == " << Prof.HotValue << "\n";
+        llvm::errs() << "[lambda-opt] Rewrote call site of '" << OriginalOp->getName() << "' to guard on closure field "
+                     << Key.FieldIndex << " == " << Prof.HotValue << " (type "
+                     << (FieldTy->isIntegerTy() ? "int" : "fp") << ")\n";
 
         Changed = true;
     }
 
     return Changed;
 }
-
 // ================= Direct (non-escaping) specializer =================
 
 class DirectLambdaSpecializer {
@@ -547,6 +674,9 @@ class DirectLambdaSpecializer {
 
             Function *OriginalOp = findLambdaOperatorFunc(M, CT);
             if (!OriginalOp)
+                continue;
+
+            if (!isProbablyUserCode(*OriginalOp))
                 continue;
 
             Function *HotClone = cloneLambdaOperator(OriginalOp, Key, Prof);
@@ -843,7 +973,7 @@ class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
         CaptureProfileMap Profiles = loadCaptureProfiles("../../logs/lambda_logs_lambda_profdata.txt");
 
-        DirectLambdaSpecializer(Profiles).run(M);
+        // DirectLambdaSpecializer(Profiles).run(M);
         EscapingLambdaSpecializer(Profiles).run(M);
 
         return PreservedAnalyses::none();
