@@ -33,10 +33,13 @@ for line in lines:
 
         tnv_table[func][varname][var] += 1
 
-        if len(tnv_table[func][varname]) > top_n:
-            tnv_table[func][varname].pop(
-                min(tnv_table[func][varname].items(), key=lambda b: b[1])[0]
-            )
+        # if len(tnv_table[func][varname]) > top_n:
+        #     tnv_table[func][varname].pop(
+        #         min(tnv_table[func][varname].items(), key=lambda b: b[1])[0]
+        #     )
+
+        # if 0 in tnv_table["multiply"]["y"]:
+        #     print(tnv_table["multiply"]["y"])
 
 outfile = logfile.removesuffix(".txt") + "_profdata.txt"
 with open(outfile, "w") as f:

@@ -6,7 +6,7 @@ std::unordered_map<std::string, size_t> g_param_freq;
 
 #include <iostream>
 
-double nude_rafe_son(int n) {
+double constexpr nude_rafe_son(int n) {
     g_log_file << "nude_rafe_son" << " " << "n=" << n << std::endl;
     g_param_freq["nude_rafe_son::n"]++;
     if (n == 0) return 0;
@@ -22,7 +22,7 @@ double nude_rafe_son(int n) {
     return curr;
 }
 
-double squirt(int n) {
+double constexpr squirt(int n) {
     g_log_file << "squirt" << " " << "n=" << n << std::endl;
     g_param_freq["squirt::n"]++;
     double z {};
