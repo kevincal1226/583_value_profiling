@@ -1,6 +1,4 @@
 #include <functional>
-#include <iostream>
-#include <vector>
 
 std::function<int(int)> make_lambda(int x) {
     // Construct a lambda that escapes return
@@ -22,6 +20,4 @@ int main() {
         auto y = make_lambda(x);
         sum += y(20);
     }
-
-    std::cout << sum << std::endl;
 }

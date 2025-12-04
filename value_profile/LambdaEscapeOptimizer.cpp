@@ -1,6 +1,6 @@
 // Pass that *detects* escaping lambdas and reports the operator() we think
-// belongs to each profiled closure. No rewriting yet: we want robust
-// identification first.
+// belongs to each profiled closure, then rewrites std::function construction
+// to install a hot specialization when the capture matches the profiled value.
 
 #include <string>
 
@@ -9,6 +9,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/raw_ostream.h"
@@ -77,6 +78,10 @@ static Function *findLambdaOperatorFunc(Module &M, StructType *ClosureTy) {
         bool LooksLambda = (Demangled.find("lambda") != std::string::npos) ||
                            (Demangled.find("$_") != std::string::npos);
 
+        // If it doesn't look like an operator() or lambda-ish symbol at all, skip.
+        if (!HasOpCall && !LooksLambda)
+            continue;
+
         if (HasOpCall)
             Score += 5;
         if (MentionsClosure)
@@ -104,6 +109,409 @@ static Function *findLambdaOperatorFunc(Module &M, StructType *ClosureTy) {
     }
 
     return Best;
+}
+
+// Replace loads from closure field with constant in clone.
+static bool specializeCaptureInClone(Function *CloneF, StructType *ClosureTy, const LambdaCaptureKey &Key,
+                                     const CaptureProfile &Prof) {
+    if (!CloneF || !ClosureTy || CloneF->arg_empty())
+        return false;
+
+    bool Changed = false;
+    SmallVector<Instruction *, 8> ToErase;
+
+    for (BasicBlock &BB : *CloneF) {
+        for (Instruction &I : BB) {
+            auto *LI = dyn_cast<LoadInst>(&I);
+            if (!LI)
+                continue;
+
+            auto *GEP = dyn_cast<GetElementPtrInst>(LI->getPointerOperand());
+            if (!GEP)
+                continue;
+
+            if (GEP->getSourceElementType() != ClosureTy)
+                continue;
+
+            if (GEP->getNumIndices() < 2)
+                continue;
+
+            auto IdxIt = GEP->idx_begin();
+            auto *Idx0 = dyn_cast<ConstantInt>(IdxIt->get());
+            auto *Idx1 = dyn_cast<ConstantInt>((++IdxIt)->get());
+            if (!Idx0 || !Idx1)
+                continue;
+
+            if (Idx0->getSExtValue() != 0)
+                continue;
+            if (Idx1->getZExtValue() != Key.FieldIndex)
+                continue;
+
+            Type *FieldTy = LI->getType();
+            Constant *ConstVal = nullptr;
+
+            if (auto *IntTy = dyn_cast<IntegerType>(FieldTy)) {
+                ConstVal = ConstantInt::get(IntTy, Prof.HotValue, /*isSigned*/ true);
+            }
+            else if (FieldTy->isFloatingPointTy()) {
+                ConstVal = ConstantFP::get(FieldTy, static_cast<double>(Prof.HotValue));
+            }
+            else {
+                continue;
+            }
+
+            LI->replaceAllUsesWith(ConstVal);
+            ToErase.push_back(LI);
+            Changed = true;
+        }
+    }
+
+    for (Instruction *I : ToErase)
+        I->eraseFromParent();
+
+    return Changed;
+}
+
+// Clone and specialize an arbitrary function for the hot capture.
+static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *ClosureTy, const LambdaCaptureKey &Key,
+                                              const CaptureProfile &Prof) {
+    if (!OrigF || OrigF->isDeclaration())
+        return nullptr;
+
+    Module *M = OrigF->getParent();
+    if (!M)
+        return nullptr;
+
+    std::string NewName = OrigF->getName().str();
+    NewName += ".lambda_hot.";
+    NewName += ClosureTy->getName().str();
+    NewName += ".field";
+    NewName += std::to_string(Key.FieldIndex);
+    NewName += ".value";
+    NewName += std::to_string(Prof.HotValue);
+
+    if (Function *Existing = M->getFunction(NewName))
+        return Existing;
+
+    FunctionType *FTy = OrigF->getFunctionType();
+    Function *NewF = Function::Create(FTy, OrigF->getLinkage(), NewName, M);
+    NewF->setCallingConv(OrigF->getCallingConv());
+    NewF->copyAttributesFrom(OrigF);
+    NewF->removeFnAttr(Attribute::NoInline);
+    NewF->addFnAttr(Attribute::AlwaysInline);
+
+    ValueToValueMapTy VMap;
+    auto A = OrigF->arg_begin();
+    auto B = NewF->arg_begin();
+    for (; A != OrigF->arg_end(); ++A, ++B) {
+        B->setName(A->getName());
+        VMap[&*A] = &*B;
+    }
+
+    SmallVector<ReturnInst *, 8> Returns;
+    CloneFunctionInto(NewF, OrigF, VMap, CloneFunctionChangeType::LocalChangesOnly, Returns);
+
+    bool Specialized = specializeCaptureInClone(NewF, ClosureTy, Key, Prof);
+    if (!Specialized) {
+        NewF->eraseFromParent();
+        return nullptr;
+    }
+
+    return NewF;
+}
+
+// Find a vtable global for this lambda's std::function instantiation.
+static GlobalVariable *findFunctionVTableForClosure(Module &M, const LambdaCaptureKey &Key) {
+    for (GlobalVariable &GV : M.globals()) {
+        if (!GV.hasInitializer())
+            continue;
+        if (!GV.getName().contains("__function6__func"))
+            continue;
+        if (!GV.getName().contains(Key.Name))
+            continue;
+        if (!GV.getValueType()->isArrayTy())
+            continue;
+        return &GV;
+    }
+    return nullptr;
+}
+
+// Extract the call-slot function (index 8 in libc++ vtable layout used here).
+static Function *getCallThunkFromVTable(GlobalVariable *VTableGV) {
+    if (!VTableGV || !VTableGV->hasInitializer())
+        return nullptr;
+
+    auto *Arr = dyn_cast<ConstantArray>(VTableGV->getInitializer());
+    if (!Arr)
+        return nullptr;
+
+    const unsigned CallIndex = 8; // null, RTTI, d1, d0, clone, clone(base), destroy, destroy_dealloc, call, target, target_type
+    if (Arr->getNumOperands() <= CallIndex)
+        return nullptr;
+
+    if (auto *CE = dyn_cast<ConstantExpr>(Arr->getOperand(CallIndex))) {
+        if (CE->isCast() && isa<Function>(CE->getOperand(0)))
+            return cast<Function>(CE->getOperand(0));
+    }
+    else if (auto *F = dyn_cast<Function>(Arr->getOperand(CallIndex))) {
+        return F;
+    }
+    return nullptr;
+}
+
+// Clone vtable with hot call thunk in the call slot.
+static GlobalVariable *cloneVTableWithHotCall(Module &M, GlobalVariable *OrigVT, Function *HotCallThunk,
+                                              const LambdaCaptureKey &Key, const CaptureProfile &Prof) {
+    if (!OrigVT || !HotCallThunk || !OrigVT->hasInitializer())
+        return nullptr;
+
+    auto *Arr = dyn_cast<ConstantArray>(OrigVT->getInitializer());
+    if (!Arr)
+        return nullptr;
+
+    SmallVector<Constant *, 16> Elts;
+    Elts.reserve(Arr->getNumOperands());
+
+    const unsigned CallIndex = 8;
+    for (unsigned i = 0; i < Arr->getNumOperands(); ++i) {
+        Constant *Op = Arr->getOperand(i);
+        if (i == CallIndex) {
+            Op = ConstantExpr::getBitCast(HotCallThunk, Op->getType());
+        }
+        Elts.push_back(Op);
+    }
+
+    Constant *NewInit = ConstantArray::get(Arr->getType(), Elts);
+
+    std::string NewName = OrigVT->getName().str();
+    NewName += ".lambda_hot.";
+    NewName += Key.Name;
+    NewName += ".field";
+    NewName += std::to_string(Key.FieldIndex);
+    NewName += ".value";
+    NewName += std::to_string(Prof.HotValue);
+
+    auto *NewGV = new GlobalVariable(M, OrigVT->getValueType(), OrigVT->isConstant(), OrigVT->getLinkage(), NewInit,
+                                     NewName, /*InsertBefore*/ nullptr, OrigVT->getThreadLocalMode(),
+                                     OrigVT->getAddressSpace());
+    NewGV->setUnnamedAddr(OrigVT->getUnnamedAddr());
+    NewGV->setAlignment(OrigVT->getAlign());
+    return NewGV;
+}
+
+// In the cloned std::function ctor, swap stored vtable to hot vtable.
+static void rewriteCtorVTableStore(Function *CtorClone, GlobalVariable *OrigVT, GlobalVariable *HotVT) {
+    if (!CtorClone || !OrigVT || !HotVT)
+        return;
+
+    SmallVector<StoreInst *, 4> Stores;
+    for (BasicBlock &BB : *CtorClone) {
+        for (Instruction &I : BB) {
+            if (auto *SI = dyn_cast<StoreInst>(&I)) {
+                if (auto *CE = dyn_cast<ConstantExpr>(SI->getValueOperand())) {
+                    if (CE->getOpcode() == Instruction::GetElementPtr && CE->getOperand(0) == OrigVT) {
+                        Stores.push_back(SI);
+                    }
+                }
+            }
+        }
+    }
+
+    for (StoreInst *SI : Stores) {
+        auto *OldCE = cast<ConstantExpr>(SI->getValueOperand());
+        SmallVector<Value *, 4> Idxs(OldCE->op_begin() + 1, OldCE->op_end()); // skip operand 0 (the GV)
+        Type *ElemTy = OrigVT->getValueType();
+        Value *NewGEP = ConstantExpr::getGetElementPtr(ElemTy, HotVT, Idxs);
+        SI->setOperand(0, NewGEP);
+    }
+}
+
+// Find the last store to closure.field before CI in the same block.
+static StoreInst *findLastStoreToClosureFieldBefore(CallInst *CI, StructType *ClosureTy, const LambdaCaptureKey &Key) {
+    if (!CI || !ClosureTy)
+        return nullptr;
+
+    BasicBlock *BB = CI->getParent();
+    if (!BB)
+        return nullptr;
+
+    StoreInst *LastStore = nullptr;
+    for (Instruction &I : *BB) {
+        if (&I == CI)
+            break;
+
+        auto *SI = dyn_cast<StoreInst>(&I);
+        if (!SI)
+            continue;
+
+        auto *GEP = dyn_cast<GetElementPtrInst>(stripPointerCasts(SI->getPointerOperand()));
+        if (!GEP)
+            continue;
+
+        if (GEP->getSourceElementType() != ClosureTy)
+            continue;
+        if (GEP->getNumIndices() < 2)
+            continue;
+
+        auto idxIt = GEP->idx_begin();
+        auto *Idx0 = dyn_cast<ConstantInt>(idxIt->get());
+        auto *Idx1 = dyn_cast<ConstantInt>((++idxIt)->get());
+        if (!Idx0 || !Idx1)
+            continue;
+        if (Idx0->getSExtValue() != 0)
+            continue;
+        if (Idx1->getZExtValue() != Key.FieldIndex)
+            continue;
+
+        LastStore = SI;
+    }
+
+    return LastStore;
+}
+
+// Rewrite std::function construction call to branch on hot capture and install specialized callable.
+static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *ClosureTy, const LambdaCaptureKey &Key,
+                                                     const CaptureProfile &Prof) {
+    if (!CI || !ClosureTy)
+        return false;
+
+    Function *OrigCallee = CI->getCalledFunction();
+    if (!OrigCallee)
+        return false;
+
+    // Skip already-hot clones to avoid infinite cloning.
+    if (OrigCallee->getName().contains(".lambda_hot."))
+        return false;
+
+    Function *HotCallee = cloneAndSpecializeForCapture(OrigCallee, ClosureTy, Key, Prof);
+    if (!HotCallee)
+        return false;
+
+    // Build hot call thunk and vtable if possible.
+    Module *M = OrigCallee->getParent();
+    GlobalVariable *OrigVT = findFunctionVTableForClosure(*M, Key);
+    Function *OrigCallThunk = getCallThunkFromVTable(OrigVT);
+    Function *HotCallThunk = cloneAndSpecializeForCapture(OrigCallThunk, ClosureTy, Key, Prof);
+    GlobalVariable *HotVT = cloneVTableWithHotCall(*M, OrigVT, HotCallThunk, Key, Prof);
+    if (HotVT)
+        rewriteCtorVTableStore(HotCallee, OrigVT, HotVT);
+
+    // Find arg that is zext(load(gep closure.field))
+    int CaptureArgIndex = -1;
+    ZExtInst *ZExt = nullptr;
+    LoadInst *Load = nullptr;
+    GetElementPtrInst *LdGEP = nullptr;
+
+    for (unsigned i = 0; i < CI->arg_size(); ++i) {
+        Value *Arg = CI->getArgOperand(i);
+        auto *Z = dyn_cast<ZExtInst>(Arg);
+        if (!Z)
+            continue;
+
+        auto *L = dyn_cast<LoadInst>(Z->getOperand(0));
+        if (!L)
+            continue;
+
+        auto *G = dyn_cast<GetElementPtrInst>(stripPointerCasts(L->getPointerOperand()));
+        if (!G)
+            continue;
+
+        if (G->getSourceElementType() != ClosureTy)
+            continue;
+        if (G->getNumIndices() < 2)
+            continue;
+
+        auto idxIt = G->idx_begin();
+        auto *Idx0 = dyn_cast<ConstantInt>(idxIt->get());
+        auto *Idx1 = dyn_cast<ConstantInt>((++idxIt)->get());
+        if (!Idx0 || !Idx1)
+            continue;
+        if (Idx0->getSExtValue() != 0)
+            continue;
+        if (Idx1->getZExtValue() != Key.FieldIndex)
+            continue;
+
+        CaptureArgIndex = static_cast<int>(i);
+        ZExt = Z;
+        Load = L;
+        LdGEP = G;
+        break;
+    }
+
+    if (CaptureArgIndex < 0)
+        return false;
+
+    // Find the store to that field earlier in the block to get the SSA value.
+    StoreInst *Store = findLastStoreToClosureFieldBefore(CI, ClosureTy, Key);
+    if (!Store)
+        return false;
+
+    Value *CaptureVal = Store->getValueOperand();
+    auto *CaptureTy = dyn_cast<IntegerType>(CaptureVal->getType());
+    auto *CtorArgTy = dyn_cast<IntegerType>(ZExt->getType());
+    if (!CaptureTy || !CtorArgTy)
+        return false;
+
+    ConstantInt *HotCapture = ConstantInt::get(CaptureTy, Prof.HotValue, /*isSigned=*/true);
+    ConstantInt *HotCtorArg = ConstantInt::get(CtorArgTy, Prof.HotValue, /*isSigned=*/true);
+
+    BasicBlock *OrigBB = CI->getParent();
+    Function *ParentF = OrigBB->getParent();
+    LLVMContext &Ctx = ParentF->getContext();
+
+    BasicBlock *MergeBB = OrigBB->splitBasicBlock(CI, "lambda.sf.merge");
+    Instruction *OldTerm = OrigBB->getTerminator();
+
+    IRBuilder<> CmpBuilder(OldTerm);
+    Value *IsHot = CmpBuilder.CreateICmpEQ(CaptureVal, HotCapture, "lambda.sf.is_hot");
+
+    auto *HotBB = BasicBlock::Create(Ctx, "lambda.sf.hot", ParentF, MergeBB);
+    auto *ColdBB = BasicBlock::Create(Ctx, "lambda.sf.cold", ParentF, MergeBB);
+
+    OldTerm->eraseFromParent();
+    IRBuilder<> BrBuilder(OrigBB);
+    BrBuilder.CreateCondBr(IsHot, HotBB, ColdBB);
+
+    SmallVector<Value *, 8> ColdArgs;
+    ColdArgs.reserve(CI->arg_size());
+    for (unsigned i = 0; i < CI->arg_size(); ++i)
+        ColdArgs.push_back(CI->getArgOperand(i));
+
+    SmallVector<Value *, 8> HotArgs = ColdArgs;
+    HotArgs[CaptureArgIndex] = HotCtorArg;
+
+    Value *ColdCall = nullptr;
+    {
+        IRBuilder<> B(ColdBB);
+        ColdCall = B.CreateCall(OrigCallee, ColdArgs, CI->getName() + ".cold");
+        B.CreateBr(MergeBB);
+    }
+
+    Value *HotCall = nullptr;
+    {
+        IRBuilder<> B(HotBB);
+        Value *CapturePtr = Store->getPointerOperand();
+        B.CreateStore(HotCapture, CapturePtr);
+        HotCall = B.CreateCall(HotCallee, HotArgs, CI->getName() + ".hot");
+        B.CreateBr(MergeBB);
+    }
+
+    if (!CI->use_empty()) {
+        IRBuilder<> MB(MergeBB);
+        MB.SetInsertPoint(&*MergeBB->begin());
+        PHINode *PHI = MB.CreatePHI(CI->getType(), 2, CI->getName() + ".sf.sel");
+        PHI->addIncoming(HotCall, HotBB);
+        PHI->addIncoming(ColdCall, ColdBB);
+        CI->replaceAllUsesWith(PHI);
+    }
+
+    CI->eraseFromParent();
+
+    errs() << "[lambda-escape] rewrote std::function ctor call for closure '" << ClosureTy->getName()
+           << "' field " << Key.FieldIndex << " hot=" << Prof.HotValue << " callee=" << OrigCallee->getName()
+           << " -> " << HotCallee->getName() << "\n";
+
+    return true;
 }
 
 // ----------------- pass body -----------------
@@ -140,7 +548,26 @@ PreservedAnalyses LambdaEscapeOptimizer::run(Module &M, ModuleAnalysisManager &)
 
         errs() << "  -> selected operator(): " << Op->getName() << " (direct calls: " << DirectCalls << ")\n";
 
-        // For now, stop at identification: no IR is mutated.
+        // Scan for ctor call sites and attempt rewrite.
+        bool Any = false;
+        for (Function &F : M) {
+            for (BasicBlock &BB : F) {
+                SmallVector<CallInst *, 8> Calls;
+                for (Instruction &I : BB)
+                    if (auto *CI = dyn_cast<CallInst>(&I))
+                        Calls.push_back(CI);
+
+                for (CallInst *CI : Calls) {
+                    if (rewriteStdFunctionConstructionWithBranch(CI, ClosureTy, Key, Prof)) {
+                        Any = true;
+                    }
+                }
+            }
+        }
+
+        if (!Any) {
+            errs() << "  -> no std::function ctor sites rewritten for this closure\n";
+        }
     }
 
     return PreservedAnalyses::all();

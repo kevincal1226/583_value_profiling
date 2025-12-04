@@ -91,6 +91,8 @@ CaptureProfileMap loadCaptureProfiles(const std::string &Path) {
                      << " (freq=" << prof.Freq << ", count=" << prof.Count << ")\n";
     }
 
+    llvm::errs() << "[lambda-prof] FINISHED LOADING DATA\n\n\n\n\n\n";
+
     return Profiles;
 }
 
