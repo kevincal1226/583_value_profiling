@@ -2,6 +2,7 @@
 // belongs to each profiled closure, then rewrites std::function construction
 // to install a hot specialization when the capture matches the profiled value.
 
+#include "llvm/ADT/DenseSet.h"
 #include <string>
 
 #include "llvm/Demangle/Demangle.h"
@@ -75,8 +76,8 @@ static Function *findLambdaOperatorFunc(Module &M, StructType *ClosureTy) {
         int Score = 0;
         bool HasOpCall = (Demangled.find("operator()") != std::string::npos);
         bool MentionsClosure = (Demangled.find(ClosureTy->getName().str()) != std::string::npos);
-        bool LooksLambda = (Demangled.find("lambda") != std::string::npos) ||
-                           (Demangled.find("$_") != std::string::npos);
+        bool LooksLambda =
+            (Demangled.find("lambda") != std::string::npos) || (Demangled.find("$_") != std::string::npos);
 
         // If it doesn't look like an operator() or lambda-ish symbol at all, skip.
         if (!HasOpCall && !LooksLambda)
@@ -172,6 +173,44 @@ static bool specializeCaptureInClone(Function *CloneF, StructType *ClosureTy, co
     return Changed;
 }
 
+// For manual validation: optionally bump integer/fp returns in hot clones so we
+// can visibly distinguish hot vs cold code paths.
+static bool bumpHotReturns(Function *F, int64_t Bump) {
+    if (!F || !F->getName().contains(".lambda_hot."))
+        return false;
+
+    bool Changed = false;
+    SmallVector<ReturnInst *, 8> Rets;
+    for (BasicBlock &BB : *F)
+        if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+            Rets.push_back(RI);
+
+    for (ReturnInst *RI : Rets) {
+        Value *V = RI->getReturnValue();
+        if (!V)
+            continue;
+
+        IRBuilder<> B(RI);
+        Type *Ty = V->getType();
+        Value *NewV = nullptr;
+        if (auto *ITy = dyn_cast<IntegerType>(Ty)) {
+            if (ITy->getBitWidth() <= 1)
+                continue; // avoid flipping boolean helpers
+            Value *C = ConstantInt::get(ITy, Bump, /*isSigned=*/true);
+            NewV = B.CreateAdd(V, C, "lambda.hot.bump");
+        }
+        else if (Ty->isFloatingPointTy()) {
+            Value *C = ConstantFP::get(Ty, static_cast<double>(Bump));
+            NewV = B.CreateFAdd(V, C, "lambda.hot.bump");
+        }
+        if (NewV) {
+            RI->setOperand(0, NewV);
+            Changed = true;
+        }
+    }
+    return Changed;
+}
+
 // Clone and specialize an arbitrary function for the hot capture.
 // If RequireSpecialization is false, we keep the clone even when no loads
 // were specialized (useful for std::function thunks / ctors where we still
@@ -219,6 +258,9 @@ static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *Closu
         NewF->eraseFromParent();
         return nullptr;
     }
+    // Manual validation hook: make hot clones produce a different output so we
+    // can see the hot path at runtime.
+    bumpHotReturns(NewF, /*Bump=*/1234567);
 
     return NewF;
 }
@@ -261,7 +303,8 @@ static Function *getCallThunkFromVTable(GlobalVariable *VTableGV) {
     if (!Arr)
         return nullptr;
 
-    const unsigned CallIndex = 8; // null, RTTI, d1, d0, clone, clone(base), destroy, destroy_dealloc, call, target, target_type
+    const unsigned CallIndex =
+        8; // null, RTTI, d1, d0, clone, clone(base), destroy, destroy_dealloc, call, target, target_type
     if (Arr->getNumOperands() <= CallIndex)
         return nullptr;
 
@@ -314,9 +357,9 @@ static GlobalVariable *cloneVTableWithHotCall(Module &M, GlobalVariable *OrigVT,
     NewName += ".value";
     NewName += std::to_string(Prof.HotValue);
 
-    auto *NewGV = new GlobalVariable(M, OrigVT->getValueType(), OrigVT->isConstant(), OrigVT->getLinkage(), NewInit,
-                                     NewName, /*InsertBefore*/ nullptr, OrigVT->getThreadLocalMode(),
-                                     OrigVT->getAddressSpace());
+    auto *NewGV =
+        new GlobalVariable(M, OrigVT->getValueType(), OrigVT->isConstant(), OrigVT->getLinkage(), NewInit, NewName,
+                           /*InsertBefore*/ nullptr, OrigVT->getThreadLocalMode(), OrigVT->getAddressSpace());
     NewGV->setUnnamedAddr(OrigVT->getUnnamedAddr());
     NewGV->setAlignment(OrigVT->getAlign());
     return NewGV;
@@ -539,6 +582,74 @@ static bool retargetNestedCtorCalls(Function *CtorClone, StructType *ClosureTy, 
     return Changed;
 }
 
+// Walk the hot call path transitively: clone any cold callees reachable from
+// RootF, rewrite their vtable stores and operator() calls to the hot versions,
+// and update call sites to point at the new clones. This ensures the hot
+// std::function call thunk doesn't accidentally re-enter cold wrappers such as
+// __invoke helpers.
+static bool retargetNestedCallsTransitively(Function *RootF, StructType *ClosureTy, const LambdaCaptureKey &Key,
+                                            const CaptureProfile &Prof, GlobalVariable *OrigVT, GlobalVariable *HotVT,
+                                            Function *ColdOp, Function *HotOp) {
+    if (!RootF)
+        return false;
+
+    bool Changed = false;
+    SmallVector<Function *, 16> Worklist;
+    DenseSet<Function *> Seen;
+    Worklist.push_back(RootF);
+
+    while (!Worklist.empty()) {
+        Function *F = Worklist.pop_back_val();
+        if (!Seen.insert(F).second)
+            continue;
+
+        if (ColdOp && HotOp)
+            Changed |= rewriteCallsToOperator(F, ColdOp, HotOp);
+
+        SmallVector<CallBase *, 8> Calls;
+        for (BasicBlock &BB : *F)
+            for (Instruction &I : BB)
+                if (auto *CB = dyn_cast<CallBase>(&I))
+                    Calls.push_back(CB);
+
+        for (CallBase *CB : Calls) {
+            Function *Callee = getDirectFunction(CB);
+            if (!Callee)
+                continue;
+
+            // If the callee is already a hot clone, keep walking its callees.
+            if (Callee->getName().contains(".lambda_hot.")) {
+                Worklist.push_back(Callee);
+                continue;
+            }
+
+            Function *Hot = cloneAndSpecializeForCapture(Callee, ClosureTy, Key, Prof, /*RequireSpecialization=*/false);
+            if (!Hot)
+                continue;
+
+            if (HotVT) {
+                rewriteCtorVTableStore(Hot, OrigVT, HotVT);
+                rewriteVTableUses(Hot, OrigVT, HotVT);
+                forceHotVTableStores(Hot, HotVT);
+            }
+            if (ColdOp && HotOp)
+                rewriteCallsToOperator(Hot, ColdOp, HotOp);
+
+            if (Hot->getFunctionType() == CB->getFunctionType()) {
+                CB->setCalledFunction(Hot);
+            }
+            else {
+                Value *NewCallee = ConstantExpr::getBitCast(Hot, CB->getFunctionType()->getPointerTo());
+                CB->setCalledFunction(FunctionCallee(CB->getFunctionType(), NewCallee));
+            }
+            Changed = true;
+            Worklist.push_back(Hot);
+        }
+    }
+
+    return Changed;
+}
+
 // Find the last store to closure.field before CI in the same block.
 static StoreInst *findLastStoreToClosureFieldBefore(CallInst *CI, StructType *ClosureTy, const LambdaCaptureKey &Key) {
     if (!CI || !ClosureTy)
@@ -626,6 +737,10 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
 
     // If the ctor delegates (e.g., C1 -> C2), make sure nested ctor calls use hot clones too.
     retargetNestedCtorCalls(HotCallee, ClosureTy, Key, Prof, OrigVT, HotVT, HotOp);
+    // Chase the hot call path transitively so helper wrappers (e.g., __invoke)
+    // also use hot clones rather than re-entering cold callables.
+    retargetNestedCallsTransitively(HotCallThunk, ClosureTy, Key, Prof, OrigVT, HotVT, ColdOp, HotOp);
+    retargetNestedCallsTransitively(HotCallee, ClosureTy, Key, Prof, OrigVT, HotVT, ColdOp, HotOp);
 
     // Find arg that is zext(load(gep closure.field))
     int CaptureArgIndex = -1;
@@ -738,9 +853,9 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
 
     CI->eraseFromParent();
 
-    errs() << "[lambda-escape] rewrote std::function ctor call for closure '" << ClosureTy->getName()
-           << "' field " << Key.FieldIndex << " hot=" << Prof.HotValue << " callee=" << OrigCallee->getName()
-           << " -> " << HotCallee->getName() << "\n";
+    errs() << "[lambda-escape] rewrote std::function ctor call for closure '" << ClosureTy->getName() << "' field "
+           << Key.FieldIndex << " hot=" << Prof.HotValue << " callee=" << OrigCallee->getName() << " -> "
+           << HotCallee->getName() << "\n";
 
     return true;
 }
