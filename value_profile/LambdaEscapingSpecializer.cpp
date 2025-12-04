@@ -101,18 +101,18 @@ static StoreInst *findStoreRecursive(Value *Ptr, BasicBlock *StartBB, Instructio
 }
 
 // Find the *last* store to the given closure field in the block, before CI.
-static StoreInst *findLastStoreToClosureFieldBefore(CallInst *CI, StructType *ClosureTy, const LambdaCaptureKey &Key) {
-    if (!CI || !ClosureTy)
+static StoreInst *findLastStoreToClosureFieldBefore(CallBase *CB, StructType *ClosureTy, const LambdaCaptureKey &Key) {
+    if (!CB || !ClosureTy)
         return nullptr;
 
-    BasicBlock *BB = CI->getParent();
+    BasicBlock *BB = CB->getParent();
     if (!BB)
         return nullptr;
 
     StoreInst *LastStore = nullptr;
 
     for (Instruction &I : *BB) {
-        if (&I == CI)
+        if (&I == CB)
             break;
 
         auto *SI = dyn_cast<StoreInst>(&I);
@@ -231,21 +231,29 @@ static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *Closu
 // Supports two patterns:
 //  1) Scalar integer capture passed as zext(load(field))
 //  2) Closure passed by-value as an aggregate ([N x i64] load from the closure)
-static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *ClosureTy, const LambdaCaptureKey &Key,
+static bool rewriteStdFunctionConstructionWithBranch(CallBase *CB, StructType *ClosureTy, const LambdaCaptureKey &Key,
                                                      const CaptureProfile &Prof) {
-    if (!CI || !ClosureTy)
+    if (!CB || !ClosureTy)
         return false;
 
     // 0) We need the original callee and a hot specialization of it.
-    Function *OrigCallee = CI->getCalledFunction();
+    Function *OrigCallee = CB->getCalledFunction();
     if (!OrigCallee)
         return false;
+    if (OrigCallee->getName().contains(".lambda_hot."))
+        return false;
+    if (BasicBlock *BB = CB->getParent()) {
+        StringRef BBName = BB->getName();
+        if (BBName.contains("lambda.sf.hot") || BBName.contains("lambda.sf.cold"))
+            return false; // don't rewrite the calls we just synthesized
+    }
 
     Function *HotCallee = cloneAndSpecializeForCapture(OrigCallee, ClosureTy, Key, Prof);
     if (!HotCallee) {
-        // If we can't build a hot specialization, just bail out and leave this
-        // call untouched.
-        return false;
+        // Fallback: even without a specialized callee, we can still branch and
+        // rewrite the capture value so the constructed std::function gets the
+        // hot value baked in.
+        HotCallee = OrigCallee;
     }
 
     // ---- Pattern A: scalar capture as zext(load(field)) ----
@@ -259,8 +267,8 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
     LoadInst *AggLoad = nullptr; // e.g. [2 x i64] load
     Value *AggPtr = nullptr;
 
-    for (unsigned i = 0; i < CI->arg_size(); ++i) {
-        Value *Arg = CI->getArgOperand(i);
+    for (unsigned i = 0; i < CB->arg_size(); ++i) {
+        Value *Arg = CB->getArgOperand(i);
 
         // Pattern A: zext(load(gep(closure.field[fieldIndex])))
         if (auto *Z = dyn_cast<ZExtInst>(Arg)) {
@@ -301,7 +309,7 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
         if (auto *L = dyn_cast<LoadInst>(Arg)) {
             if (L->getType()->isArrayTy()) {
                 // Quick sanity: only used by this call
-                if (!L->hasOneUse() || L->user_back() != CI)
+                if (!L->hasOneUse() || L->user_back() != CB)
                     continue;
 
                 // Optional: we could require the pointer to originate from
@@ -320,7 +328,7 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
         return false;
 
     // 2) Find the store to that closure field earlier in the block: this gives us "x".
-    StoreInst *Store = findLastStoreToClosureFieldBefore(CI, ClosureTy, Key);
+    StoreInst *Store = findLastStoreToClosureFieldBefore(CB, ClosureTy, Key);
     if (!Store) {
         llvm::errs() << "[lambda-opt] Escaping: could not find store to "
                         "closure field before std::function ctor; skipping.\n";
@@ -337,13 +345,26 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
 
     ConstantInt *HotCapture = ConstantInt::get(CaptureTy, Prof.HotValue, /*isSigned=*/true);
 
-    BasicBlock *OrigBB = CI->getParent();
+    BasicBlock *OrigBB = CB->getParent();
     Function *ParentF = OrigBB->getParent();
     LLVMContext &Ctx = ParentF->getContext();
 
-    // 3) Split block at the ctor call
-    BasicBlock *MergeBB = OrigBB->splitBasicBlock(CI, "lambda.sf.merge");
+    // We need to handle both call and invoke sites.
+    bool IsInvoke = isa<InvokeInst>(CB);
 
+    BasicBlock *MergeBB = nullptr;
+    BasicBlock *UnwindDest = nullptr;
+
+    if (IsInvoke) {
+        auto *II = cast<InvokeInst>(CB);
+        UnwindDest = II->getUnwindDest();
+        MergeBB = BasicBlock::Create(Ctx, "lambda.sf.merge", ParentF, II->getNormalDest());
+    }
+    else {
+        MergeBB = OrigBB->splitBasicBlock(CB->getIterator(), "lambda.sf.merge");
+    }
+
+    // 3) Split block at the ctor call
     Instruction *OldTerm = OrigBB->getTerminator();
     IRBuilder<> CmpBuilder(OldTerm);
 
@@ -354,15 +375,11 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
     auto *HotBB = BasicBlock::Create(Ctx, "lambda.sf.hot", ParentF, MergeBB);
     auto *ColdBB = BasicBlock::Create(Ctx, "lambda.sf.cold", ParentF, MergeBB);
 
-    OldTerm->eraseFromParent();
-    IRBuilder<> BrBuilder(OrigBB);
-    BrBuilder.CreateCondBr(IsHot, HotBB, ColdBB);
-
     // 4) Build arg lists for ctor (baseline: original args)
     SmallVector<Value *, 8> ColdArgs;
-    ColdArgs.reserve(CI->arg_size());
-    for (unsigned i = 0; i < CI->arg_size(); ++i)
-        ColdArgs.push_back(CI->getArgOperand(i));
+    ColdArgs.reserve(CB->arg_size());
+    for (unsigned i = 0; i < CB->arg_size(); ++i)
+        ColdArgs.push_back(CB->getArgOperand(i));
 
     SmallVector<Value *, 8> HotArgs = ColdArgs;
 
@@ -384,6 +401,18 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
     // the hot capture into the closure. We will patch the args below.
 
     // 5) Cold path: original semantics (but we may rebuild aggregate arg)
+    // Replace the original terminator with our guard once we've consumed CB.
+    bool DetachedInvoke = false;
+    if (IsInvoke) {
+        CB->removeFromParent(); // detach so we can insert a branch
+        DetachedInvoke = true;
+    }
+    else {
+        OldTerm->eraseFromParent();
+    }
+    IRBuilder<> BrBuilder(OrigBB);
+    BrBuilder.CreateCondBr(IsHot, HotBB, ColdBB);
+
     Value *ColdCall = nullptr;
     {
         IRBuilder<> B(ColdBB);
@@ -395,8 +424,14 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
             ColdArgs[AggArgIndex] = NewAggLoad;
         }
 
-        ColdCall = B.CreateCall(OrigCallee, ColdArgs, CI->getName() + ".cold");
-        B.CreateBr(MergeBB);
+        if (IsInvoke) {
+            auto *II = cast<InvokeInst>(CB);
+            ColdCall = B.CreateInvoke(OrigCallee, MergeBB, UnwindDest, ColdArgs, CB->getName() + ".cold");
+        }
+        else {
+            ColdCall = B.CreateCall(OrigCallee, ColdArgs, CB->getName() + ".cold");
+            B.CreateBr(MergeBB);
+        }
     }
 
     // 6) Hot path:
@@ -417,25 +452,54 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
             HotArgs[AggArgIndex] = NewAggLoad;
         }
 
-        HotCall = B.CreateCall(HotCallee, HotArgs, CI->getName() + ".hot");
-        B.CreateBr(MergeBB);
+        if (IsInvoke) {
+            auto *II = cast<InvokeInst>(CB);
+            HotCall = B.CreateInvoke(HotCallee, MergeBB, UnwindDest, HotArgs, CB->getName() + ".hot");
+        }
+        else {
+            HotCall = B.CreateCall(HotCallee, HotArgs, CB->getName() + ".hot");
+            B.CreateBr(MergeBB);
+        }
     }
 
     // 7) Merge ctor result if it is used (often it is not)
-    if (!CI->use_empty()) {
+    if (!CB->getType()->isVoidTy()) {
         IRBuilder<> MB(MergeBB);
-        MB.SetInsertPoint(&*MergeBB->begin());
-        PHINode *PHI = MB.CreatePHI(CI->getType(), 2, CI->getName() + ".sf.sel");
+        auto InsertIt = MergeBB->getFirstNonPHIOrDbgOrAlloca();
+        if (InsertIt != MergeBB->end())
+            MB.SetInsertPoint(&*InsertIt);
+
+        PHINode *PHI = MB.CreatePHI(CB->getType(), 2, CB->getName() + ".sf.sel");
         PHI->addIncoming(HotCall, HotBB);
         PHI->addIncoming(ColdCall, ColdBB);
-        CI->replaceAllUsesWith(PHI);
+        if (!CB->use_empty())
+            CB->replaceAllUsesWith(PHI);
+    }
+
+    // For invoke, redirect the merge block to the original normal dest and
+    // update incoming edges.
+    if (IsInvoke) {
+        auto *II = cast<InvokeInst>(CB);
+        BasicBlock *NormalDest = II->getNormalDest();
+        BranchInst::Create(NormalDest, MergeBB);
+
+        // Any PHI nodes that expected OrigBB now expect MergeBB.
+        for (PHINode &PN : NormalDest->phis()) {
+            PN.replaceIncomingBlockWith(OrigBB, MergeBB);
+        }
     }
 
     // 8) Clean up: original call + (optionally) original AggLoad
     if (AggLoad && AggLoad->use_empty())
         AggLoad->eraseFromParent();
 
-    CI->eraseFromParent();
+    if (DetachedInvoke) {
+        CB->dropAllReferences();
+        delete CB;
+    }
+    else {
+        CB->eraseFromParent();
+    }
 
     llvm::errs() << "[lambda-opt] Escaping: branched std::function "
                     "construction for closure '"
@@ -449,6 +513,10 @@ bool EscapingLambdaSpecializer::run(Module &M) {
     bool Changed = false;
 
     for (auto &[Key, Prof] : Profiles) {
+        // Skip noisy stdlib helper structs that show up in the profile.
+        if (Key.Name.find("class.anon") == std::string::npos)
+            continue;
+
         StructType *CT = findClosureType(M, Key);
         if (CT == nullptr) {
             continue;
@@ -456,13 +524,13 @@ bool EscapingLambdaSpecializer::run(Module &M) {
 
         for (Function &F : M) {
             for (BasicBlock &BB : F) {
-                SmallVector<CallInst *, 8> Calls;
+                SmallVector<CallBase *, 8> Calls;
                 for (Instruction &I : BB)
-                    if (auto *CI = dyn_cast<CallInst>(&I))
-                        Calls.push_back(CI);
+                    if (auto *CB = dyn_cast<CallBase>(&I))
+                        Calls.push_back(CB);
 
-                for (CallInst *CI : Calls) {
-                    if (rewriteStdFunctionConstructionWithBranch(CI, CT, Key, Prof)) {
+                for (CallBase *CB : Calls) {
+                    if (rewriteStdFunctionConstructionWithBranch(CB, CT, Key, Prof)) {
                         Changed = true;
                     }
                 }
