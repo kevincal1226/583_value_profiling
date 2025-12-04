@@ -446,7 +446,7 @@ struct IndirectCallOptimizer : public PassInfoMixin<IndirectCallOptimizer> {
                 }
 
 
-                auto const call_name = call_instr->getCalledOperand()->getNameOrAsOperand();
+                auto const call_name = call_instr->getNameOrAsOperand();
                 if (!optimizable_indirect_calls.contains(call_name)) {
                     continue;
                 }
@@ -516,14 +516,14 @@ struct ValueProfiler : PassInfoMixin<ValueProfiler> {
 
         // insert the actual call
         Value* file_ptr = builder.CreateLoad(builder.getPtrTy(), global_fileptr);
-        builder.CreateCall(get_or_insert_fprintf_func(module), { file_ptr, fmt_ptr, func_ptr });
+        auto call = builder.CreateCall(get_or_insert_fprintf_func(module), { file_ptr, fmt_ptr, func_ptr });
     }
 
     auto print_indirect_call(Module& module, LLVMContext& context, CallInst* call_inst) {
         IRBuilder<> builder { call_inst };
 
         // get the variables name and create the fmt string for it
-        std::string const name = "%" + call_inst->getCalledOperand()->getNameOrAsOperand();
+        std::string const name = call_inst->getNameOrAsOperand();
         GlobalVariable* const fmt = make_fmt(module, context, "ICALL " + name + " %p\n");
 
         // get pointers to the fmt string and function
@@ -582,7 +582,6 @@ struct ValueProfiler : PassInfoMixin<ValueProfiler> {
                 }
             }
         }
-
 
         return PreservedAnalyses::none();
     }
