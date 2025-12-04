@@ -11,7 +11,7 @@ auto multiply(int x, int y) {
     g_param_freq["multiply::x"]++;
     g_param_freq["multiply::y"]++;
     int acc = 0;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 10; ++i) {
         acc += (x * y * (i)) / (i % 3 + 1);
     }
     return acc;
@@ -52,7 +52,7 @@ auto spmv() {
 }
 
 int main() {
-    for (int i = 0; i < 1000; ++i) {
+    for (int i = 0; i < 100; ++i) {
         spmv();
     }
     return 0;
