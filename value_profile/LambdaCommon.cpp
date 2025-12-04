@@ -180,7 +180,7 @@ Function *cloneLambdaOperator(Function *OriginalFunc, const LambdaCaptureKey &Ke
 
     Module *M = OriginalFunc->getParent();
     std::string NewName = OriginalFunc->getName().str();
-    NewName += ".hot.field";
+    NewName += ".hot_lambda_operator";
     NewName += std::to_string(Key.FieldIndex);
     NewName += ".value";
     NewName += std::to_string(Prof.HotValue);

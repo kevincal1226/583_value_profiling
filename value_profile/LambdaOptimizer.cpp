@@ -45,7 +45,7 @@ class LambdaOptimizer : public PassInfoMixin<LambdaOptimizer> {
         // Keep behavior identical to your original file:
         // Direct specialization exists but is disabled by default.
         //
-        // Changed |= DirectLambdaSpecializer(Profiles).run(M);
+        Changed |= DirectLambdaSpecializer(Profiles).run(M);
         Changed |= EscapingLambdaSpecializer(Profiles).run(M);
 
         (void)Changed; // currently we always report "none()" regardless
