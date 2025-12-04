@@ -2,12 +2,9 @@
 #include "llvm/Passes/PassPlugin.h"
 
 #include "lambda_capture_collector.cpp"
-// #include "lambda_optimizer.cpp"
 #include "value_profiling.cpp"
 
-#include "LambdaEscapingSpecializer.hpp"
-
-#include "LambdaOptimizer.cpp"
+#include "LambdaEscapeOptimizer.hpp"
 
 using namespace llvm;
 
@@ -37,10 +34,19 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                     });
 
                 // Register MODULE PASS: lambda_capture_collector
+                // PB.registerPipelineParsingCallback(
+                //     [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
+                //         if (Name == "lambda_optimizer") {
+                //             MPM.addPass(lambdaopt::LambdaOptimizer());
+                //             return true;
+                //         }
+                //         return false;
+                //     });
+
                 PB.registerPipelineParsingCallback(
                     [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
                         if (Name == "lambda_optimizer") {
-                            MPM.addPass(lambdaopt::LambdaOptimizer());
+                            MPM.addPass(lambdaopt::LambdaEscapeOptimizer());
                             return true;
                         }
                         return false;

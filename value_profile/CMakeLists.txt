@@ -5,7 +5,5 @@ add_llvm_pass_plugin(
     lambda_optimizer.cpp
     plugin_registration.cpp
     LambdaCommon.cpp
-    LambdaDirectSpecializer.cpp
-    LambdaEscapingSpecializer.cpp
-    LambdaOptimizer.cpp
+    LambdaEscapeOptimizer.cpp
 )
