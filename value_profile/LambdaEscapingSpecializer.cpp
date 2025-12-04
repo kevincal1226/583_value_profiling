@@ -213,6 +213,97 @@ static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *Closu
     return NewF;
 }
 
+// Build a lightweight wrapper that forces one argument to the hot constant and
+// forwards to OrigCallee. This guarantees the hot path calls a distinct
+// function even if we could not specialize loads inside OrigCallee.
+static Function *buildHotArgWrapper(Function *OrigCallee, StructType *ClosureTy, const LambdaCaptureKey &Key,
+                                    const CaptureProfile &Prof, int OverrideArgIndex, bool IsAggregateArg) {
+    if (!OrigCallee)
+        return nullptr;
+
+    Module *M = OrigCallee->getParent();
+    if (!M)
+        return nullptr;
+
+    std::string NewName = OrigCallee->getName().str();
+    NewName += ".lambda_hot_wrapper.";
+    NewName += ClosureTy->getName().str();
+    NewName += ".field";
+    NewName += std::to_string(Key.FieldIndex);
+    NewName += ".value";
+    NewName += std::to_string(Prof.HotValue);
+
+    if (Function *Existing = M->getFunction(NewName))
+        return Existing;
+
+    FunctionType *FTy = OrigCallee->getFunctionType();
+    Function *Wrapper = Function::Create(FTy, OrigCallee->getLinkage(), NewName, M);
+    Wrapper->copyAttributesFrom(OrigCallee);
+    Wrapper->removeFnAttr(Attribute::NoInline);
+    Wrapper->addFnAttr(Attribute::AlwaysInline);
+
+    BasicBlock *Entry = BasicBlock::Create(M->getContext(), "entry", Wrapper);
+    IRBuilder<> B(Entry);
+
+    SmallVector<Value *, 8> Args;
+    Args.reserve(Wrapper->arg_size());
+
+    for (unsigned i = 0; i < Wrapper->arg_size(); ++i) {
+        Argument &Arg = *Wrapper->getArg(i);
+        if (static_cast<int>(i) == OverrideArgIndex) {
+            if (IsAggregateArg) {
+                Value *Agg = &Arg;
+                Type *AggTy = Agg->getType();
+                Value *HotAgg = Agg;
+
+                // For aggregates, attempt to insert the hot constant into the
+                // requested field index if it is an array/struct of scalars.
+                if (auto *ArrTy = dyn_cast<ArrayType>(AggTy)) {
+                    Type *ElemTy = ArrTy->getElementType();
+                    Value *ElemConst = nullptr;
+                    if (auto *ElemInt = dyn_cast<IntegerType>(ElemTy))
+                        ElemConst = ConstantInt::get(ElemInt, Prof.HotValue, /*isSigned=*/true);
+                    else if (ElemTy->isFloatingPointTy())
+                        ElemConst = ConstantFP::get(ElemTy, static_cast<double>(Prof.HotValue));
+
+                    if (ElemConst && Key.FieldIndex < ArrTy->getNumElements()) {
+                        HotAgg = B.CreateInsertValue(Agg, ElemConst, {Key.FieldIndex}, Agg->getName() + ".hot");
+                    }
+                }
+                // If we can't meaningfully rewrite, just forward the original aggregate.
+                Args.push_back(HotAgg);
+            }
+            else {
+                Type *ArgTy = Arg.getType();
+                Value *ConstArg = nullptr;
+                if (auto *IntTy = dyn_cast<IntegerType>(ArgTy))
+                    ConstArg = ConstantInt::get(IntTy, Prof.HotValue, /*isSigned=*/true);
+                else if (ArgTy->isFloatingPointTy())
+                    ConstArg = ConstantFP::get(ArgTy, static_cast<double>(Prof.HotValue));
+                if (ConstArg)
+                    Args.push_back(ConstArg);
+                else
+                    Args.push_back(&Arg);
+            }
+        }
+        else {
+            Args.push_back(&Arg);
+        }
+    }
+
+    Value *Ret = nullptr;
+    if (OrigCallee->getReturnType()->isVoidTy()) {
+        B.CreateCall(OrigCallee, Args);
+        B.CreateRetVoid();
+    }
+    else {
+        Ret = B.CreateCall(OrigCallee, Args, "hot.call");
+        B.CreateRet(Ret);
+    }
+
+    return Wrapper;
+}
+
 // Rewrite a std::function ctor call so we *branch once* on the capture value:
 //
 //   if (x == HotValue)
@@ -249,12 +340,6 @@ static bool rewriteStdFunctionConstructionWithBranch(CallBase *CB, StructType *C
     }
 
     Function *HotCallee = cloneAndSpecializeForCapture(OrigCallee, ClosureTy, Key, Prof);
-    if (!HotCallee) {
-        // Fallback: even without a specialized callee, we can still branch and
-        // rewrite the capture value so the constructed std::function gets the
-        // hot value baked in.
-        HotCallee = OrigCallee;
-    }
 
     // ---- Pattern A: scalar capture as zext(load(field)) ----
     int ScalarCaptureArgIndex = -1;
@@ -326,6 +411,17 @@ static bool rewriteStdFunctionConstructionWithBranch(CallBase *CB, StructType *C
     // If we matched neither pattern, this ctor is not in a form we handle.
     if (ScalarCaptureArgIndex < 0 && AggArgIndex < 0)
         return false;
+
+    // If we could not build a specialized callee, synthesize a tiny wrapper
+    // that forces the hot value into the ctor argument so the hot path calls a
+    // distinct function body.
+    if (!HotCallee) {
+        int OverrideIdx = (ScalarCaptureArgIndex >= 0) ? ScalarCaptureArgIndex : AggArgIndex;
+        bool IsAgg = (ScalarCaptureArgIndex < 0);
+        HotCallee = buildHotArgWrapper(OrigCallee, ClosureTy, Key, Prof, OverrideIdx, IsAgg);
+        if (!HotCallee)
+            return false;
+    }
 
     // 2) Find the store to that closure field earlier in the block: this gives us "x".
     StoreInst *Store = findLastStoreToClosureFieldBefore(CB, ClosureTy, Key);
@@ -449,7 +545,32 @@ static bool rewriteStdFunctionConstructionWithBranch(CallBase *CB, StructType *C
         // capture bit pattern in the closure.
         if (AggArgIndex >= 0 && AggLoad && AggPtr) {
             Value *NewAggLoad = B.CreateLoad(AggLoad->getType(), AggPtr, AggLoad->getName() + ".sf.hot");
-            HotArgs[AggArgIndex] = NewAggLoad;
+
+            // Rewrite the specific capture slot to the constant so the callee
+            // receives the baked-in value even if it copies the aggregate.
+            if (auto *ArrTy = dyn_cast<ArrayType>(AggLoad->getType())) {
+                Type *ElemTy = ArrTy->getElementType();
+                Value *ElemConst = nullptr;
+                if (auto *ElemInt = dyn_cast<IntegerType>(ElemTy)) {
+                    ElemConst = ConstantInt::get(ElemInt, Prof.HotValue, /*isSigned=*/true);
+                }
+                else if (ElemTy->isFloatingPointTy()) {
+                    ElemConst = ConstantFP::get(ElemTy, static_cast<double>(Prof.HotValue));
+                }
+                if (ElemConst) {
+                    // Index sequence: [0, FieldIndex] for a simple array payload.
+                    Value *HotAgg =
+                        B.CreateInsertValue(NewAggLoad, ElemConst, {static_cast<unsigned>(Key.FieldIndex)},
+                                            NewAggLoad->getName() + ".with_hot");
+                    HotArgs[AggArgIndex] = HotAgg;
+                }
+                else {
+                    HotArgs[AggArgIndex] = NewAggLoad;
+                }
+            }
+            else {
+                HotArgs[AggArgIndex] = NewAggLoad;
+            }
         }
 
         if (IsInvoke) {
