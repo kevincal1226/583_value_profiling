@@ -1,9 +1,10 @@
 #include <functional>
+#include <iostream>
 
 std::function<int(int)> make_lambda(int x) {
     // Construct a lambda that escapes return
 
-    return [x](int y) { return (y * 2) + x; };
+    return [x](int y) { return (y * 2) + x + 987654321; };
 }
 
 int main() {
@@ -20,4 +21,6 @@ int main() {
         auto y = make_lambda(x);
         sum += y(20);
     }
+
+    std::cout << sum << std::endl;
 }
