@@ -3,6 +3,7 @@
 #include <set>
 
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
@@ -213,6 +214,285 @@ static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *Closu
     return NewF;
 }
 
+// Ensure we have a hot clone of the lambda operator with the capture baked in.
+static Function *getOrCreateHotLambdaOperator(Module &M, StructType *ClosureTy, const LambdaCaptureKey &Key,
+                                              const CaptureProfile &Prof) {
+    Function *OriginalOp = findLambdaOperatorFunc(M, ClosureTy);
+    if (!OriginalOp)
+        return nullptr;
+
+    std::string HotName = OriginalOp->getName().str();
+    HotName += ".hot.field";
+    HotName += std::to_string(Key.FieldIndex);
+    HotName += ".value";
+    HotName += std::to_string(Prof.HotValue);
+
+    if (Function *Existing = M.getFunction(HotName))
+        return Existing;
+
+    Function *HotClone = cloneLambdaOperator(OriginalOp, Key, Prof);
+    if (!HotClone)
+        return nullptr;
+
+    bool Specialized = specializeCaptureInClone(HotClone, ClosureTy, Key, Prof);
+    if (!Specialized) {
+        errs() << "[lambda-opt] Escaping: hot lambda operator clone had no matching loads: " << HotClone->getName()
+               << "\n";
+        HotClone->eraseFromParent();
+        return nullptr;
+    }
+
+    HotClone->removeFnAttr(Attribute::NoInline);
+    HotClone->addFnAttr(Attribute::AlwaysInline);
+    return HotClone;
+}
+
+static StructType *findFunctionImplStruct(Module &M, StructType *ClosureTy) {
+    for (StructType *ST : M.getIdentifiedStructTypes()) {
+        if (!ST || ST->isOpaque())
+            continue;
+        if (!ST->getName().contains("__function::__func"))
+            continue;
+        if (ST->getNumElements() >= 2 && ST->getElementType(1) == ClosureTy)
+            return ST;
+    }
+    return nullptr;
+}
+
+static StructType *findStdFunctionStruct(Module &M) {
+    for (StructType *ST : M.getIdentifiedStructTypes()) {
+        if (!ST || ST->isOpaque())
+            continue;
+        if (ST->getName().contains("class.std::__1::function"))
+            return ST;
+    }
+    return nullptr;
+}
+
+// Find the std::function __call thunk whose second field is the lambda closure.
+static Function *findStdFunctionCallThunk(Module &M, StructType *ClosureTy) {
+    StructType *FuncImplTy = findFunctionImplStruct(M, ClosureTy);
+    for (Function &F : M) {
+        if (F.isDeclaration())
+            continue;
+
+        if (!F.getName().contains("__function6__func"))
+            continue;
+        if (!F.getName().contains("clE")) // call operator entry in the vtable
+            continue;
+
+        if (F.arg_size() < 2)
+            continue;
+
+        if (FuncImplTy) {
+            bool MentionsImpl = false;
+            for (Instruction &I : instructions(F)) {
+                if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+                    if (GEP->getSourceElementType() == FuncImplTy) {
+                        MentionsImpl = true;
+                        break;
+                    }
+                }
+            }
+            if (!MentionsImpl)
+                continue;
+        }
+
+        return &F;
+    }
+    return nullptr;
+}
+
+// The vtable constant that references the given __call thunk.
+static GlobalVariable *findVTableForCallThunk(Module &M, Function *CallThunk) {
+    if (!CallThunk)
+        return nullptr;
+
+    for (GlobalVariable &GV : M.globals()) {
+        if (!GV.hasInitializer())
+            continue;
+        if (!GV.getName().contains("__function6__func"))
+            continue;
+
+        auto *InitStruct = dyn_cast<ConstantStruct>(GV.getInitializer());
+        if (!InitStruct || InitStruct->getNumOperands() == 0)
+            continue;
+
+        auto *Arr = dyn_cast<ConstantArray>(InitStruct->getOperand(0));
+        if (!Arr)
+            continue;
+
+        for (unsigned i = 0; i < Arr->getNumOperands(); ++i) {
+            Constant *Op = Arr->getOperand(i);
+            if (auto *CE = dyn_cast<ConstantExpr>(Op)) {
+                if (CE->getOpcode() == Instruction::BitCast)
+                    Op = CE->getOperand(0);
+            }
+
+            if (Op == CallThunk)
+                return &GV;
+        }
+    }
+
+    return nullptr;
+}
+
+static GlobalVariable *cloneVTableWithHotCall(GlobalVariable *OrigVT, Function *HotCall, const LambdaCaptureKey &Key,
+                                              const CaptureProfile &Prof) {
+    if (!OrigVT || !HotCall)
+        return nullptr;
+
+    std::string NewName = OrigVT->getName().str();
+    NewName += ".lambda_hot.field";
+    NewName += std::to_string(Key.FieldIndex);
+    NewName += ".value";
+    NewName += std::to_string(Prof.HotValue);
+
+    if (GlobalVariable *Existing = OrigVT->getParent()->getNamedGlobal(NewName))
+        return Existing;
+
+    auto *InitStruct = dyn_cast<ConstantStruct>(OrigVT->getInitializer());
+    if (!InitStruct || InitStruct->getNumOperands() == 0)
+        return nullptr;
+
+    auto *Arr = dyn_cast<ConstantArray>(InitStruct->getOperand(0));
+    if (!Arr || Arr->getNumOperands() <= 8)
+        return nullptr;
+
+    SmallVector<Constant *, 11> Elts;
+    Elts.reserve(Arr->getNumOperands());
+    for (unsigned i = 0; i < Arr->getNumOperands(); ++i) {
+        if (i == 8) {
+            Constant *HotPtr = ConstantExpr::getBitCast(HotCall, Arr->getType()->getElementType());
+            Elts.push_back(HotPtr);
+        }
+        else {
+            Elts.push_back(Arr->getOperand(i));
+        }
+    }
+
+    auto *NewArr = ConstantArray::get(Arr->getType(), Elts);
+    auto *NewInit = ConstantStruct::get(cast<StructType>(InitStruct->getType()), NewArr);
+
+    auto *NewGV = new GlobalVariable(*OrigVT->getParent(), NewInit->getType(), /*isConstant*/ true,
+                                     OrigVT->getLinkage(), NewInit, NewName, /*InsertBefore*/ nullptr,
+                                     OrigVT->getThreadLocalMode(), OrigVT->getAddressSpace());
+    NewGV->copyAttributesFrom(OrigVT);
+    NewGV->setInitializer(NewInit);
+    return NewGV;
+}
+
+static Constant *buildHotVTablePointer(GlobalVariable *VTableGV) {
+    if (!VTableGV)
+        return nullptr;
+    auto *VTStructTy = dyn_cast<StructType>(VTableGV->getValueType());
+    if (!VTStructTy || VTStructTy->getNumElements() == 0)
+        return nullptr;
+    auto *ArrTy = dyn_cast<ArrayType>(VTStructTy->getElementType(0));
+    if (!ArrTy || ArrTy->getNumElements() <= 2)
+        return nullptr;
+
+    LLVMContext &Ctx = VTableGV->getContext();
+    Constant *Zero = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
+    Constant *Two = ConstantInt::get(Type::getInt32Ty(Ctx), 2);
+    SmallVector<Constant *, 3> Indices = {Zero, Zero, Two};
+    return ConstantExpr::getInBoundsGetElementPtr(VTableGV->getValueType(), VTableGV, Indices);
+}
+
+// Build a hot __call thunk that forwards directly to the hot lambda operator.
+static Function *buildHotFunctionCallThunk(Function *OrigCall, Function *HotLambdaOp, StructType *ClosureTy,
+                                           const LambdaCaptureKey &Key, const CaptureProfile &Prof) {
+    if (!OrigCall || !HotLambdaOp)
+        return nullptr;
+
+    Module *M = OrigCall->getParent();
+    LLVMContext &Ctx = M->getContext();
+
+    StructType *FuncImplTy = findFunctionImplStruct(*M, ClosureTy);
+    if (!FuncImplTy || FuncImplTy->isOpaque() || FuncImplTy->getNumElements() < 2)
+        return nullptr;
+
+    std::string NewName = OrigCall->getName().str();
+    NewName += ".lambda_hot.field";
+    NewName += std::to_string(Key.FieldIndex);
+    NewName += ".value";
+    NewName += std::to_string(Prof.HotValue);
+
+    if (Function *Existing = M->getFunction(NewName))
+        return Existing;
+
+    Function *Thunk = Function::Create(OrigCall->getFunctionType(), OrigCall->getLinkage(), NewName, M);
+    Thunk->setCallingConv(OrigCall->getCallingConv());
+    Thunk->copyAttributesFrom(OrigCall);
+    Thunk->removeFnAttr(Attribute::NoInline);
+    Thunk->addFnAttr(Attribute::AlwaysInline);
+
+    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Thunk);
+    IRBuilder<> B(Entry);
+
+    auto ArgIt = Thunk->arg_begin();
+    Argument *ThisArg = ArgIt++;
+
+    // Extract the lambda object out of the __function::__func wrapper.
+    Value *LambdaPtr = B.CreateStructGEP(FuncImplTy, ThisArg, 1, "lambda.obj");
+
+    SmallVector<Value *, 4> Args;
+    Args.push_back(LambdaPtr);
+
+    unsigned OpArgIndex = 1;
+    for (; ArgIt != Thunk->arg_end() && OpArgIndex < HotLambdaOp->arg_size(); ++ArgIt, ++OpArgIndex) {
+        Argument *ArgPtr = &*ArgIt;
+        Type *LoadTy = HotLambdaOp->getFunctionType()->getParamType(OpArgIndex);
+        Value *Val = nullptr;
+        if (LoadTy) {
+            unsigned AS = 0;
+            if (auto *PT = dyn_cast<PointerType>(ArgPtr->getType()))
+                AS = PT->getAddressSpace();
+            Value *Ptr = ArgPtr;
+            if (!ArgPtr->getType()->isPointerTy()) {
+                Ptr = B.CreateBitCast(ArgPtr, PointerType::get(Ctx, AS));
+            }
+            Val = B.CreateLoad(LoadTy, Ptr, "arg" + std::to_string(OpArgIndex));
+        }
+        Args.push_back(Val ? Val : ArgPtr);
+    }
+
+    Value *Res = B.CreateCall(HotLambdaOp, Args, "hot.call");
+    B.CreateRet(Res);
+    return Thunk;
+}
+
+// After construction, patch the std::function object's vptr to the hot vtable.
+static void patchFunctionVTable(IRBuilder<> &B, Value *FunctionObjPtr, Constant *HotVPtrConst) {
+    if (!FunctionObjPtr || !HotVPtrConst)
+        return;
+
+    Module *M = B.GetInsertBlock()->getModule();
+    StructType *FuncStructTy = findStdFunctionStruct(*M);
+    if (!FuncStructTy || FuncStructTy->isOpaque() || FuncStructTy->getNumElements() == 0)
+        return;
+
+    auto *ValueFuncTy = dyn_cast<StructType>(FuncStructTy->getElementType(0));
+    if (!ValueFuncTy || ValueFuncTy->isOpaque() || ValueFuncTy->getNumElements() < 2)
+        return;
+
+    LLVMContext &Ctx = B.getContext();
+    // Field 1 of __value_func is the pointer to the erased callable (__base).
+    Value *ValueFuncPtr = B.CreateStructGEP(FuncStructTy, FunctionObjPtr, 0, "value.func");
+    Value *BasePtrPtr = B.CreateStructGEP(ValueFuncTy, ValueFuncPtr, 1, "value.func.ptr");
+    Value *BasePtr = B.CreateLoad(PointerType::get(Ctx, 0), BasePtrPtr, "callable.ptr");
+
+    StructType *BaseTy = StructType::getTypeByName(Ctx, "class.std::__1::__function::__base");
+    if (!BaseTy)
+        BaseTy = StructType::getTypeByName(Ctx, "class.std::__1::__function::__baseIFddEEE");
+    if (!BaseTy)
+        return;
+
+    Value *BaseObj = B.CreateBitCast(BasePtr, PointerType::get(Ctx, BasePtr->getType()->getPointerAddressSpace()));
+    Value *VPtrSlot = B.CreateStructGEP(BaseTy, BaseObj, 0, "vptr.slot");
+    B.CreateStore(HotVPtrConst, VPtrSlot);
+}
+
 // Build a lightweight wrapper that forces one argument to the hot constant and
 // forwards to OrigCallee. This guarantees the hot path calls a distinct
 // function even if we could not specialize loads inside OrigCallee.
@@ -327,6 +607,8 @@ static bool rewriteStdFunctionConstructionWithBranch(CallBase *CB, StructType *C
     if (!CB || !ClosureTy)
         return false;
 
+    Module *M = CB->getFunction()->getParent();
+
     // 0) We need the original callee and a hot specialization of it.
     Function *OrigCallee = CB->getCalledFunction();
     if (!OrigCallee)
@@ -341,6 +623,15 @@ static bool rewriteStdFunctionConstructionWithBranch(CallBase *CB, StructType *C
 
     Function *HotCallee = cloneAndSpecializeForCapture(OrigCallee, ClosureTy, Key, Prof);
 
+    // Prepare hot lambda/operator plumbing so escaping std::function objects
+    // dispatch to the specialized body on the hot path.
+    Function *HotLambdaOp = getOrCreateHotLambdaOperator(*M, ClosureTy, Key, Prof);
+    Function *StdFuncCallThunk = findStdFunctionCallThunk(*M, ClosureTy);
+    GlobalVariable *StdFuncVTable = findVTableForCallThunk(*M, StdFuncCallThunk);
+    Function *HotStdFuncCallThunk =
+        buildHotFunctionCallThunk(StdFuncCallThunk, HotLambdaOp, ClosureTy, Key, Prof);
+    GlobalVariable *HotVTable = cloneVTableWithHotCall(StdFuncVTable, HotStdFuncCallThunk, Key, Prof);
+    Constant *HotVPtrConst = buildHotVTablePointer(HotVTable);
     // ---- Pattern A: scalar capture as zext(load(field)) ----
     int ScalarCaptureArgIndex = -1;
     ZExtInst *ZExt = nullptr;
@@ -533,7 +824,10 @@ static bool rewriteStdFunctionConstructionWithBranch(CallBase *CB, StructType *C
     // 6) Hot path:
     //    - overwrite closure field with HotValue (so any remaining loads see it)
     //    - call the *specialized* callee
+    //    - retarget the vtable so std::function calls the hot operator()
     Value *HotCall = nullptr;
+    BasicBlock *HotResultBB = HotBB;
+    BasicBlock *HotInvokeCont = nullptr;
     {
         IRBuilder<> B(HotBB);
 
@@ -575,12 +869,44 @@ static bool rewriteStdFunctionConstructionWithBranch(CallBase *CB, StructType *C
 
         if (IsInvoke) {
             auto *II = cast<InvokeInst>(CB);
-            HotCall = B.CreateInvoke(HotCallee, MergeBB, UnwindDest, HotArgs, CB->getName() + ".hot");
+            HotInvokeCont = BasicBlock::Create(Ctx, "lambda.sf.hot.cont", ParentF, MergeBB);
+            HotCall = B.CreateInvoke(HotCallee, HotInvokeCont, UnwindDest, HotArgs, CB->getName() + ".hot");
+            HotResultBB = HotInvokeCont;
         }
         else {
             HotCall = B.CreateCall(HotCallee, HotArgs, CB->getName() + ".hot");
-            B.CreateBr(MergeBB);
         }
+    }
+
+    // If we have a hot vtable, install it before merging.
+    if (HotVPtrConst) {
+        IRBuilder<> PatchB(IsInvoke ? HotInvokeCont : HotBB);
+        if (IsInvoke && HotInvokeCont) {
+            // Insert after the invoke in the continuation block.
+            auto IP = HotInvokeCont->getFirstInsertionPt();
+            if (IP != HotInvokeCont->end())
+                PatchB.SetInsertPoint(&*IP);
+            else
+                PatchB.SetInsertPoint(HotInvokeCont);
+        }
+        patchFunctionVTable(PatchB, CB->getArgOperand(0), HotVPtrConst);
+        if (IsInvoke && HotInvokeCont) {
+            PatchB.CreateBr(MergeBB);
+        }
+        else {
+            PatchB.CreateBr(MergeBB);
+        }
+    }
+    else if (IsInvoke && HotInvokeCont) {
+        IRBuilder<> BranchB(HotInvokeCont);
+        if (!HotInvokeCont->getTerminator())
+            BranchB.CreateBr(MergeBB);
+    }
+    else if (!IsInvoke) {
+        // For a normal call with no patching, ensure control still flows to the merge block.
+        IRBuilder<> BranchB(HotBB);
+        if (!HotBB->getTerminator())
+            BranchB.CreateBr(MergeBB);
     }
 
     // 7) Merge ctor result if it is used (often it is not)
@@ -591,7 +917,7 @@ static bool rewriteStdFunctionConstructionWithBranch(CallBase *CB, StructType *C
             MB.SetInsertPoint(&*InsertIt);
 
         PHINode *PHI = MB.CreatePHI(CB->getType(), 2, CB->getName() + ".sf.sel");
-        PHI->addIncoming(HotCall, HotBB);
+        PHI->addIncoming(HotCall, HotResultBB);
         PHI->addIncoming(ColdCall, ColdBB);
         if (!CB->use_empty())
             CB->replaceAllUsesWith(PHI);

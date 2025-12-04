@@ -282,7 +282,14 @@ class LambdaCaptureCollector : public PassInfoMixin<LambdaCaptureCollector> {
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
         LLVMContext &context = M.getContext();
 
-        BasicBlock &main_func_bb = *M.getFunction("main")->begin();
+        if (M.empty())
+            return PreservedAnalyses::all();
+
+        Function *MainF = M.getFunction("main");
+        if (MainF == nullptr || MainF->empty())
+            return PreservedAnalyses::all();
+
+        BasicBlock &main_func_bb = *MainF->begin();
 
         if (global_fileptr == nullptr) {
             IRBuilder<> builder(&main_func_bb, main_func_bb.begin());
