@@ -4,6 +4,8 @@
 std::function<int(int)> make_lambda(int x) {
     // Construct a lambda that escapes return
 
+    std::cout << x << std::endl;
+
     return [x](int y) { return (y * 2) + x + 987654321; };
 }
 

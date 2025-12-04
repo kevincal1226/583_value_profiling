@@ -173,8 +173,11 @@ static bool specializeCaptureInClone(Function *CloneF, StructType *ClosureTy, co
 }
 
 // Clone and specialize an arbitrary function for the hot capture.
+// If RequireSpecialization is false, we keep the clone even when no loads
+// were specialized (useful for std::function thunks / ctors where we still
+// want to retarget nested calls or vtables).
 static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *ClosureTy, const LambdaCaptureKey &Key,
-                                              const CaptureProfile &Prof) {
+                                              const CaptureProfile &Prof, bool RequireSpecialization = true) {
     if (!OrigF || OrigF->isDeclaration())
         return nullptr;
 
@@ -212,7 +215,7 @@ static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *Closu
     CloneFunctionInto(NewF, OrigF, VMap, CloneFunctionChangeType::LocalChangesOnly, Returns);
 
     bool Specialized = specializeCaptureInClone(NewF, ClosureTy, Key, Prof);
-    if (!Specialized) {
+    if (!Specialized && RequireSpecialization) {
         NewF->eraseFromParent();
         return nullptr;
     }
@@ -221,19 +224,32 @@ static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *Closu
 }
 
 // Find a vtable global for this lambda's std::function instantiation.
+static ConstantArray *extractVTableArray(Constant *Init) {
+    if (auto *Arr = dyn_cast<ConstantArray>(Init))
+        return Arr;
+    if (auto *CS = dyn_cast<ConstantStruct>(Init)) {
+        if (CS->getNumOperands() == 1)
+            if (auto *Arr = dyn_cast<ConstantArray>(CS->getOperand(0)))
+                return Arr;
+    }
+    return nullptr;
+}
+
 static GlobalVariable *findFunctionVTableForClosure(Module &M, const LambdaCaptureKey &Key) {
+    GlobalVariable *FirstMatch = nullptr;
     for (GlobalVariable &GV : M.globals()) {
         if (!GV.hasInitializer())
             continue;
         if (!GV.getName().contains("__function6__func"))
             continue;
-        if (!GV.getName().contains(Key.Name))
+        if (!extractVTableArray(GV.getInitializer()))
             continue;
-        if (!GV.getValueType()->isArrayTy())
-            continue;
-        return &GV;
+        if (GV.getName().contains(Key.Name))
+            return &GV; // strong match on closure name
+        if (!FirstMatch)
+            FirstMatch = &GV; // fallback: remember first function vtable we see
     }
-    return nullptr;
+    return FirstMatch;
 }
 
 // Extract the call-slot function (index 8 in libc++ vtable layout used here).
@@ -241,7 +257,7 @@ static Function *getCallThunkFromVTable(GlobalVariable *VTableGV) {
     if (!VTableGV || !VTableGV->hasInitializer())
         return nullptr;
 
-    auto *Arr = dyn_cast<ConstantArray>(VTableGV->getInitializer());
+    ConstantArray *Arr = extractVTableArray(VTableGV->getInitializer());
     if (!Arr)
         return nullptr;
 
@@ -265,7 +281,8 @@ static GlobalVariable *cloneVTableWithHotCall(Module &M, GlobalVariable *OrigVT,
     if (!OrigVT || !HotCallThunk || !OrigVT->hasInitializer())
         return nullptr;
 
-    auto *Arr = dyn_cast<ConstantArray>(OrigVT->getInitializer());
+    Constant *OrigInit = OrigVT->getInitializer();
+    ConstantArray *Arr = extractVTableArray(OrigInit);
     if (!Arr)
         return nullptr;
 
@@ -281,7 +298,13 @@ static GlobalVariable *cloneVTableWithHotCall(Module &M, GlobalVariable *OrigVT,
         Elts.push_back(Op);
     }
 
-    Constant *NewInit = ConstantArray::get(Arr->getType(), Elts);
+    Constant *NewArrayInit = ConstantArray::get(Arr->getType(), Elts);
+    Constant *NewInit = NewArrayInit;
+    if (auto *CS = dyn_cast<ConstantStruct>(OrigInit)) {
+        SmallVector<Constant *, 1> Fields;
+        Fields.push_back(NewArrayInit);
+        NewInit = ConstantStruct::get(cast<StructType>(OrigVT->getValueType()), Fields);
+    }
 
     std::string NewName = OrigVT->getName().str();
     NewName += ".lambda_hot.";
@@ -297,6 +320,148 @@ static GlobalVariable *cloneVTableWithHotCall(Module &M, GlobalVariable *OrigVT,
     NewGV->setUnnamedAddr(OrigVT->getUnnamedAddr());
     NewGV->setAlignment(OrigVT->getAlign());
     return NewGV;
+}
+
+// Replace any reference to OrigVT inside F with HotVT (bitcasted as needed).
+static bool rewriteVTableUses(Function *F, GlobalVariable *OrigVT, GlobalVariable *HotVT) {
+    if (!F || !OrigVT || !HotVT)
+        return false;
+
+    bool Changed = false;
+    for (BasicBlock &BB : *F) {
+        for (Instruction &I : BB) {
+            for (unsigned idx = 0; idx < I.getNumOperands(); ++idx) {
+                Value *Op = I.getOperand(idx);
+                if (Op != OrigVT)
+                    continue;
+                Value *NewOp = HotVT;
+                if (Op->getType() != HotVT->getType())
+                    NewOp = ConstantExpr::getBitCast(HotVT, Op->getType());
+                I.setOperand(idx, NewOp);
+                Changed = true;
+            }
+        }
+    }
+    return Changed;
+}
+
+// Fallback: replace any std::function vtable store inside F with HotVT,
+// even if we failed to match the exact original vtable symbol.
+static bool forceHotVTableStores(Function *F, GlobalVariable *HotVT) {
+    if (!F || !HotVT)
+        return false;
+    bool Changed = false;
+
+    for (BasicBlock &BB : *F) {
+        for (Instruction &I : BB) {
+            auto *SI = dyn_cast<StoreInst>(&I);
+            if (!SI)
+                continue;
+            auto *CE = dyn_cast<ConstantExpr>(SI->getValueOperand());
+            if (!CE)
+                continue;
+            if (CE->getOpcode() != Instruction::GetElementPtr)
+                continue;
+            auto *GV = dyn_cast<GlobalVariable>(CE->getOperand(0));
+            if (!GV || !GV->getName().contains("__function6__func"))
+                continue;
+
+            SmallVector<Value *, 4> Idxs(CE->op_begin() + 1, CE->op_end()); // skip operand 0 (the GV)
+            Value *NewGEP = ConstantExpr::getGetElementPtr(HotVT->getValueType(), HotVT, Idxs, /*InBounds=*/false);
+            SI->setOperand(0, NewGEP);
+            Changed = true;
+        }
+    }
+    return Changed;
+}
+
+// Rewrite any operand that is a GEP/bitcast of OrigVT inside the whole module.
+static bool rewriteVTableInModule(Module &M, GlobalVariable *OrigVT, GlobalVariable *HotVT) {
+    if (!OrigVT || !HotVT)
+        return false;
+    bool Changed = false;
+
+    auto rewriteOperand = [&](Instruction &I, unsigned idx, ConstantExpr *CE) {
+        SmallVector<Value *, 8> Ops(CE->op_begin(), CE->op_end());
+        if (Ops.empty())
+            return false;
+        if (Ops[0] != OrigVT)
+            return false;
+        Ops[0] = HotVT;
+        Constant *NewCE = nullptr;
+        if (CE->getOpcode() == Instruction::GetElementPtr)
+            NewCE = ConstantExpr::getGetElementPtr(HotVT->getValueType(), HotVT, ArrayRef<Value *>(Ops).slice(1),
+                                                   /*InBounds=*/false);
+        else if (CE->isCast())
+            NewCE = ConstantExpr::getCast(CE->getOpcode(), HotVT, CE->getType());
+        else
+            return false;
+        I.setOperand(idx, NewCE);
+        return true;
+    };
+
+    for (Function &F : M) {
+        for (BasicBlock &BB : F) {
+            for (Instruction &I : BB) {
+                for (unsigned idx = 0; idx < I.getNumOperands(); ++idx) {
+                    Value *Op = I.getOperand(idx);
+                    if (Op == OrigVT) {
+                        Value *NewOp = HotVT;
+                        if (Op->getType() != HotVT->getType())
+                            NewOp = ConstantExpr::getBitCast(HotVT, Op->getType());
+                        I.setOperand(idx, NewOp);
+                        Changed = true;
+                        continue;
+                    }
+                    if (auto *CE = dyn_cast<ConstantExpr>(Op)) {
+                        if (rewriteOperand(I, idx, CE))
+                            Changed = true;
+                    }
+                }
+            }
+        }
+    }
+    return Changed;
+}
+
+static Function *getDirectFunction(CallBase *CB) {
+    if (!CB)
+        return nullptr;
+    if (Function *F = CB->getCalledFunction())
+        return F;
+    if (auto *CE = dyn_cast<ConstantExpr>(CB->getCalledOperand()))
+        if (CE->isCast())
+            if (auto *F = dyn_cast<Function>(CE->getOperand(0)))
+                return F;
+    return nullptr;
+}
+
+// If a clone still calls the cold lambda operator(), redirect it to the hot clone.
+static bool rewriteCallsToOperator(Function *F, Function *ColdOp, Function *HotOp) {
+    if (!F || !ColdOp || !HotOp)
+        return false;
+
+    bool Changed = false;
+    for (BasicBlock &BB : *F) {
+        for (Instruction &I : BB) {
+            auto *CB = dyn_cast<CallBase>(&I);
+            if (!CB)
+                continue;
+            Function *Callee = getDirectFunction(CB);
+            if (Callee != ColdOp)
+                continue;
+
+            if (HotOp->getFunctionType() == CB->getFunctionType()) {
+                CB->setCalledFunction(HotOp);
+            }
+            else {
+                Value *NewCallee = ConstantExpr::getBitCast(HotOp, CB->getFunctionType()->getPointerTo());
+                CB->setCalledFunction(FunctionCallee(CB->getFunctionType(), NewCallee));
+            }
+            Changed = true;
+        }
+    }
+    return Changed;
 }
 
 // In the cloned std::function ctor, swap stored vtable to hot vtable.
@@ -324,6 +489,54 @@ static void rewriteCtorVTableStore(Function *CtorClone, GlobalVariable *OrigVT, 
         Value *NewGEP = ConstantExpr::getGetElementPtr(ElemTy, HotVT, Idxs);
         SI->setOperand(0, NewGEP);
     }
+}
+
+// Inside a cloned ctor, any delegation calls (e.g., C1 -> C2) or helper calls
+// will still point at the *cold* versions. If those helpers touch the lambda
+// closure, we need to redirect them to their own hot clones so the hot path
+// does not fall back to constructing a cold lambda.
+static bool retargetNestedCtorCalls(Function *CtorClone, StructType *ClosureTy, const LambdaCaptureKey &Key,
+                                    const CaptureProfile &Prof, GlobalVariable *OrigVT, GlobalVariable *HotVT,
+                                    Function *HotOp) {
+    if (!CtorClone)
+        return false;
+
+    bool Changed = false;
+    SmallVector<CallBase *, 8> Calls;
+
+    for (BasicBlock &BB : *CtorClone)
+        for (Instruction &I : BB)
+            if (auto *CB = dyn_cast<CallBase>(&I))
+                if (CB->getCalledFunction() && !CB->getCalledFunction()->getName().contains(".lambda_hot."))
+                    Calls.push_back(CB);
+
+    for (CallBase *CB : Calls) {
+        Function *Callee = getDirectFunction(CB);
+        if (!Callee)
+            continue;
+
+        // Try to build a hot clone of this callee. If specialization fails, skip.
+        Function *Hot = cloneAndSpecializeForCapture(Callee, ClosureTy, Key, Prof,
+                                                     /*RequireSpecialization=*/false);
+        if (!Hot)
+            continue;
+
+        // Ensure the nested clone installs the hot vtable too (if it has one).
+        rewriteCtorVTableStore(Hot, OrigVT, HotVT);
+        if (HotOp)
+            rewriteCallsToOperator(Hot, Callee, HotOp);
+
+        if (Hot->getFunctionType() == CB->getFunctionType()) {
+            CB->setCalledFunction(Hot);
+        }
+        else {
+            Value *NewCallee = ConstantExpr::getBitCast(Hot, CB->getFunctionType()->getPointerTo());
+            CB->setCalledFunction(FunctionCallee(CB->getFunctionType(), NewCallee));
+        }
+        Changed = true;
+    }
+
+    return Changed;
 }
 
 // Find the last store to closure.field before CI in the same block.
@@ -383,7 +596,12 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
     if (OrigCallee->getName().contains(".lambda_hot."))
         return false;
 
-    Function *HotCallee = cloneAndSpecializeForCapture(OrigCallee, ClosureTy, Key, Prof);
+    // Build a hot clone of the lambda's operator() so the call thunk can use it.
+    Function *ColdOp = findLambdaOperatorFunc(*CI->getModule(), ClosureTy);
+    Function *HotOp = cloneAndSpecializeForCapture(ColdOp, ClosureTy, Key, Prof);
+
+    Function *HotCallee =
+        cloneAndSpecializeForCapture(OrigCallee, ClosureTy, Key, Prof, /*RequireSpecialization=*/false);
     if (!HotCallee)
         return false;
 
@@ -391,10 +609,23 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
     Module *M = OrigCallee->getParent();
     GlobalVariable *OrigVT = findFunctionVTableForClosure(*M, Key);
     Function *OrigCallThunk = getCallThunkFromVTable(OrigVT);
-    Function *HotCallThunk = cloneAndSpecializeForCapture(OrigCallThunk, ClosureTy, Key, Prof);
+    Function *HotCallThunk =
+        cloneAndSpecializeForCapture(OrigCallThunk, ClosureTy, Key, Prof, /*RequireSpecialization=*/false);
     GlobalVariable *HotVT = cloneVTableWithHotCall(*M, OrigVT, HotCallThunk, Key, Prof);
-    if (HotVT)
+    if (HotVT) {
         rewriteCtorVTableStore(HotCallee, OrigVT, HotVT);
+        rewriteVTableUses(HotCallee, OrigVT, HotVT);
+        rewriteVTableUses(HotCallThunk, OrigVT, HotVT);
+        rewriteVTableInModule(*M, OrigVT, HotVT); // last-resort rewrite for any remaining uses
+        forceHotVTableStores(HotCallee, HotVT);
+        forceHotVTableStores(HotCallThunk, HotVT);
+    }
+    // Redirect any cold operator() calls inside the hot ctor or call thunk.
+    rewriteCallsToOperator(HotCallee, ColdOp, HotOp);
+    rewriteCallsToOperator(HotCallThunk, ColdOp, HotOp);
+
+    // If the ctor delegates (e.g., C1 -> C2), make sure nested ctor calls use hot clones too.
+    retargetNestedCtorCalls(HotCallee, ClosureTy, Key, Prof, OrigVT, HotVT, HotOp);
 
     // Find arg that is zext(load(gep closure.field))
     int CaptureArgIndex = -1;
