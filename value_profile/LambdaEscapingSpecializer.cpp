@@ -199,15 +199,10 @@ static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *Closu
     // Now specialize loads from closure.field[Key.FieldIndex] to Prof.HotValue.
     bool Specialized = specializeCaptureInClone(NewF, ClosureTy, Key, Prof);
     if (!Specialized) {
-        std::string Name = NewF->getName().str();
-        if (Name.find("std::") == std::string::npos && Name.find("__clang") == std::string::npos &&
-            Name.find("__cxxabiv1") == std::string::npos && Name.find("llvm.") == std::string::npos &&
-            Name.find("allocator") == std::string::npos &&
-            Name.find("_ZNSt") == std::string::npos) { // demangled std:: prefix
-            llvm::errs() << "[lambda-opt] cloneAndSpecializeForCapture: NO MATCHING LOADS — erasing unused clone: "
-                         << Name << "\n";
-        }
 
+        errs() << "[lambda-opt] cloneAndSpecializeForCapture: no "
+                  "matching loads in clone '"
+               << NewF->getName() << "'; erasing.\n";
         NewF->eraseFromParent();
         return nullptr;
     }
@@ -226,17 +221,25 @@ static Function *cloneAndSpecializeForCapture(Function *OrigF, StructType *Closu
 //       std::function(..., x);
 //
 // After this, the returned std::function is either hot or cold, but not both.
+// Rewrite a std::function ctor call so we *branch once* on the capture value:
+//
+//   if (x == HotValue)
+//       std::function(..., HotValue);
+//   else
+//       std::function(..., x);
+//
+// Supports two patterns:
+//  1) Scalar integer capture passed as zext(load(field))
+//  2) Closure passed by-value as an aggregate ([N x i64] load from the closure)
 static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *ClosureTy, const LambdaCaptureKey &Key,
                                                      const CaptureProfile &Prof) {
-    if ((CI == nullptr) || (ClosureTy == nullptr)) {
+    if (!CI || !ClosureTy)
         return false;
-    }
 
     // 0) We need the original callee and a hot specialization of it.
     Function *OrigCallee = CI->getCalledFunction();
-    if (!OrigCallee) {
+    if (!OrigCallee)
         return false;
-    }
 
     Function *HotCallee = cloneAndSpecializeForCapture(OrigCallee, ClosureTy, Key, Prof);
     if (!HotCallee) {
@@ -245,84 +248,94 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
         return false;
     }
 
-    // 1) Find ctor argument that is zext(load(closure.field[fieldIndex]))
-    int CaptureArgIndex = -1;
+    // ---- Pattern A: scalar capture as zext(load(field)) ----
+    int ScalarCaptureArgIndex = -1;
     ZExtInst *ZExt = nullptr;
-    LoadInst *Load = nullptr;
-    GetElementPtrInst *LdGEP = nullptr;
+    LoadInst *ScalarLoad = nullptr;
+    GetElementPtrInst *ScalarLdGEP = nullptr;
+
+    // ---- Pattern B: aggregate closure passed by-value ----
+    int AggArgIndex = -1;
+    LoadInst *AggLoad = nullptr; // e.g. [2 x i64] load
+    Value *AggPtr = nullptr;
 
     for (unsigned i = 0; i < CI->arg_size(); ++i) {
         Value *Arg = CI->getArgOperand(i);
 
-        auto *Z = dyn_cast<ZExtInst>(Arg);
-        if (Z == nullptr) {
+        // Pattern A: zext(load(gep(closure.field[fieldIndex])))
+        if (auto *Z = dyn_cast<ZExtInst>(Arg)) {
+            auto *L = dyn_cast<LoadInst>(Z->getOperand(0));
+            if (!L)
+                continue;
+
+            Value *Ptr = L->getPointerOperand();
+            auto *G = dyn_cast<GetElementPtrInst>(stripPointerCasts(Ptr));
+            if (!G)
+                continue;
+
+            if (G->getSourceElementType() != ClosureTy)
+                continue;
+            if (G->getNumIndices() < 2)
+                continue;
+
+            auto idxIt = G->idx_begin();
+            auto *Idx0 = dyn_cast<ConstantInt>(idxIt->get());
+            auto *Idx1 = dyn_cast<ConstantInt>((++idxIt)->get());
+            if (!Idx0 || !Idx1)
+                continue;
+
+            if (Idx0->getSExtValue() != 0)
+                continue;
+            if (Idx1->getZExtValue() != Key.FieldIndex)
+                continue;
+
+            ScalarCaptureArgIndex = static_cast<int>(i);
+            ZExt = Z;
+            ScalarLoad = L;
+            ScalarLdGEP = G;
+            (void)ScalarLdGEP;
             continue;
         }
 
-        auto *L = dyn_cast<LoadInst>(Z->getOperand(0));
-        if (L == nullptr) {
-            continue;
-        }
+        // Pattern B: whole closure loaded as [N x i64]
+        if (auto *L = dyn_cast<LoadInst>(Arg)) {
+            if (L->getType()->isArrayTy()) {
+                // Quick sanity: only used by this call
+                if (!L->hasOneUse() || L->user_back() != CI)
+                    continue;
 
-        Value *Ptr = L->getPointerOperand();
-        auto *G = dyn_cast<GetElementPtrInst>(stripPointerCasts(Ptr));
-        if (G == nullptr) {
-            continue;
+                // Optional: we could require the pointer to originate from
+                // a GEP of ClosureTy, but in practice this pattern is
+                // generated from %class.anon allocas.
+                AggArgIndex = static_cast<int>(i);
+                AggLoad = L;
+                AggPtr = L->getPointerOperand();
+                continue;
+            }
         }
-
-        if (G->getSourceElementType() != ClosureTy) {
-            continue;
-        }
-        if (G->getNumIndices() < 2) {
-            continue;
-        }
-
-        auto idxIt = G->idx_begin();
-        auto *Idx0 = dyn_cast<ConstantInt>(idxIt->get());
-        auto *Idx1 = dyn_cast<ConstantInt>((++idxIt)->get());
-        if ((Idx0 == nullptr) || (Idx1 == nullptr)) {
-            continue;
-        }
-
-        if (Idx0->getSExtValue() != 0) {
-            continue;
-        }
-        if (Idx1->getZExtValue() != Key.FieldIndex) {
-            continue;
-        }
-
-        CaptureArgIndex = static_cast<int>(i);
-        ZExt = Z;
-        Load = L;
-        LdGEP = G;
-        (void)LdGEP; // kept only for debugging / completeness
-        break;
     }
 
-    if (CaptureArgIndex < 0) {
+    // If we matched neither pattern, this ctor is not in a form we handle.
+    if (ScalarCaptureArgIndex < 0 && AggArgIndex < 0)
         return false;
-    }
 
     // 2) Find the store to that closure field earlier in the block: this gives us "x".
     StoreInst *Store = findLastStoreToClosureFieldBefore(CI, ClosureTy, Key);
-    if (Store == nullptr) {
-        errs() << "[lambda-opt] Escaping: could not find store to "
-                  "closure field before std::function ctor; skipping.\n";
+    if (!Store) {
+        llvm::errs() << "[lambda-opt] Escaping: could not find store to "
+                        "closure field before std::function ctor; skipping.\n";
         return false;
     }
 
     Value *CaptureVal = Store->getValueOperand(); // this is "x"
     auto *CaptureTy = dyn_cast<IntegerType>(CaptureVal->getType());
-    auto *CtorArgTy = dyn_cast<IntegerType>(ZExt->getType());
-
-    if (!CaptureTy || !CtorArgTy) {
-        errs() << "[lambda-opt] Escaping: non-integer capture or ctor arg; "
-                  "skipping.\n";
+    if (!CaptureTy) {
+        llvm::errs() << "[lambda-opt] Escaping: non-integer capture value; "
+                        "skipping.\n";
         return false;
     }
 
     ConstantInt *HotCapture = ConstantInt::get(CaptureTy, Prof.HotValue, /*isSigned=*/true);
-    ConstantInt *HotCtorArg = ConstantInt::get(CtorArgTy, Prof.HotValue, /*isSigned=*/true);
 
     BasicBlock *OrigBB = CI->getParent();
     Function *ParentF = OrigBB->getParent();
@@ -345,32 +358,65 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
     IRBuilder<> BrBuilder(OrigBB);
     BrBuilder.CreateCondBr(IsHot, HotBB, ColdBB);
 
-    // 4) Build arg lists for ctor
+    // 4) Build arg lists for ctor (baseline: original args)
     SmallVector<Value *, 8> ColdArgs;
     ColdArgs.reserve(CI->arg_size());
     for (unsigned i = 0; i < CI->arg_size(); ++i)
         ColdArgs.push_back(CI->getArgOperand(i));
 
     SmallVector<Value *, 8> HotArgs = ColdArgs;
-    HotArgs[CaptureArgIndex] = HotCtorArg;
 
-    // 5) Cold path: original semantics
+    // Pattern A (scalar): override ctor arg with hot constant (zext’d)
+    if (ScalarCaptureArgIndex >= 0) {
+        auto *CtorArgTy = dyn_cast<IntegerType>(ZExt->getType());
+        if (!CtorArgTy) {
+            llvm::errs() << "[lambda-opt] Escaping: unexpected non-int ctor "
+                            "arg type in scalar pattern; skipping.\n";
+            return false;
+        }
+
+        ConstantInt *HotCtorArg = ConstantInt::get(CtorArgTy, Prof.HotValue, /*isSigned=*/true);
+        HotArgs[ScalarCaptureArgIndex] = HotCtorArg;
+    }
+
+    // NOTE: for Pattern B (aggregate), we will *not* directly reuse AggLoad.
+    // Instead, we re-materialize loads in each branch after we possibly store
+    // the hot capture into the closure. We will patch the args below.
+
+    // 5) Cold path: original semantics (but we may rebuild aggregate arg)
     Value *ColdCall = nullptr;
     {
         IRBuilder<> B(ColdBB);
+
+        // If we had an aggregate arg, rebuild the load *here*,
+        // so we don't depend on the original AggLoad in OrigBB.
+        if (AggArgIndex >= 0 && AggLoad && AggPtr) {
+            Value *NewAggLoad = B.CreateLoad(AggLoad->getType(), AggPtr, AggLoad->getName() + ".sf.cold");
+            ColdArgs[AggArgIndex] = NewAggLoad;
+        }
+
         ColdCall = B.CreateCall(OrigCallee, ColdArgs, CI->getName() + ".cold");
         B.CreateBr(MergeBB);
     }
 
     // 6) Hot path:
-    //    - overwrite closure field with HotValue (so any remaining loads see 10)
-    //    - call the *specialized* callee, which also has the hot value baked in
+    //    - overwrite closure field with HotValue (so any remaining loads see it)
+    //    - call the *specialized* callee
     Value *HotCall = nullptr;
     {
         IRBuilder<> B(HotBB);
-        // Reuse the same field pointer as the store
+
+        // Overwrite the capture field with the hot value:
         Value *CapturePtr = Store->getPointerOperand();
         B.CreateStore(HotCapture, CapturePtr);
+
+        // If aggregate arg, re-load it *after* the store, so it sees the hot
+        // capture bit pattern in the closure.
+        if (AggArgIndex >= 0 && AggLoad && AggPtr) {
+            Value *NewAggLoad = B.CreateLoad(AggLoad->getType(), AggPtr, AggLoad->getName() + ".sf.hot");
+            HotArgs[AggArgIndex] = NewAggLoad;
+        }
+
         HotCall = B.CreateCall(HotCallee, HotArgs, CI->getName() + ".hot");
         B.CreateBr(MergeBB);
     }
@@ -385,12 +431,16 @@ static bool rewriteStdFunctionConstructionWithBranch(CallInst *CI, StructType *C
         CI->replaceAllUsesWith(PHI);
     }
 
+    // 8) Clean up: original call + (optionally) original AggLoad
+    if (AggLoad && AggLoad->use_empty())
+        AggLoad->eraseFromParent();
+
     CI->eraseFromParent();
 
-    errs() << "[lambda-opt] Escaping: branched std::function construction for "
-              "closure '"
-           << ClosureTy->getName() << "', field " << Key.FieldIndex << " on value == " << Prof.HotValue
-           << " using specialized callee '" << HotCallee->getName() << "'\n";
+    llvm::errs() << "[lambda-opt] Escaping: branched std::function "
+                    "construction for closure '"
+                 << ClosureTy->getName() << "', field " << Key.FieldIndex << " on value == " << Prof.HotValue
+                 << " using specialized callee '" << HotCallee->getName() << "'\n";
 
     return true;
 }
