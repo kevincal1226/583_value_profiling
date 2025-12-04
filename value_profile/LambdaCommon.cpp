@@ -1,9 +1,7 @@
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
-#include <vector>
 
 #include <llvm/Demangle/Demangle.h>
 #include <llvm/IR/BasicBlock.h>
@@ -15,15 +13,7 @@
 
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/PassManager.h"
-#include "llvm/Passes/PassBuilder.h"
-#include "llvm/Passes/PassPlugin.h"
-#include "llvm/ProfileData/InstrProf.h"
 #include "llvm/ProfileData/InstrProfData.inc"
-#include "llvm/Transforms/Utils/BasicBlockUtils.h"
-#include "llvm/Transforms/Utils/Cloning.h"
 
 #include "LambdaCommon.hpp"
 

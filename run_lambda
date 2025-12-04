@@ -92,7 +92,7 @@ RUNNING PROFILER
 
 "
 
-./"${FILENAME}_lambda_profiler" >/dev/null
+(gtimeout 0.5s ./"${FILENAME}_lambda_profiler" >/dev/null) || true
 
 ##############################################
 #            COLLECT RESULTS
