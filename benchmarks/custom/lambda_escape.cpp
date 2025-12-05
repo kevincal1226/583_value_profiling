@@ -1,12 +1,17 @@
 #include <functional>
 #include <iostream>
 
+extern "C" std::function<int(int)> *lambdaopt_init_function_from_fp(std::function<int(int)> *out, int (*fp)(int)) {
+    new (out) std::function<int(int)>(fp);
+    return out;
+}
+
 std::function<int(int)> make_lambda(int x) {
     // Construct a lambda that escapes return
 
     std::cout << x << std::endl;
 
-    return [x](int y) { return (y * 2) + x + 987654321; };
+    return [x](int y) { return (y * 2) + x + 10; };
 }
 
 int main() {
