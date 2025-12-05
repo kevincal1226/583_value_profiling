@@ -25,7 +25,10 @@ for line in lines:
     if "no args" in line:
         continue
 
-    _, lambda_name, capture_arg, value = line.strip().split(" ")
+    try:
+        _, lambda_name, capture_arg, value = line.strip().split(" ")
+    except:
+        break
 
     lambda_construction_count[lambda_name][capture_arg] += 1
 

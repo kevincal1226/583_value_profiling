@@ -176,45 +176,66 @@ void handleStdFunctionCtor(Module &M, CallInst *CI, CaptureProfileMap Profiles) 
         Function *HotClone = cloneAndSpecializeLambdaBody(LambdaBody, ST, HotValue);
         errs() << "Created hot clone: " << HotClone->getName() << "\n";
 
-        // ====== NEW: rewrite this ctor call to use HotClone on the hot path ======
-
         Module &Mod = *CI->getModule();
         LLVMContext &Ctx = Mod.getContext();
 
+        // ====== NEW: rewrite this ctor call to use HotClone on the hot path ======
+
         Function *ParentF = CI->getFunction();
 
-        // We only handle the simple case that matches your current IR:
-        //  - function returns void
-        //  - ctor's return value is unused
+        // Only support: returning void + ctor result unused (make_lambdai case)
         if (!ParentF->getReturnType()->isVoidTy()) {
-            errs() << "lambdaopt: non-void function; skipping ctor rewrite.\n";
+            errs() << "lambdaopt: non-void function; skipping rewrite.\n";
             return;
         }
         if (!CI->use_empty()) {
-            errs() << "lambdaopt: ctor return has uses; skipping ctor rewrite.\n";
+            errs() << "lambdaopt: ctor result has uses; skipping rewrite.\n";
             return;
         }
 
-        // Split the block at CI:
-        //   OrigBB: instructions *before* CI, ends with branch to ColdBB
-        //   ColdBB: starts with CI, then original 'ret void'
+        // === Create a trampoline: int (int) that calls the hot clone ===
+
+        Type *IntTy = Type::getInt32Ty(Ctx);
+        FunctionType *TrampTy = FunctionType::get(IntTy, {IntTy}, false);
+
+        std::string TrampName = (HotClone->getName() + ".fp_tramp").str();
+        Function *Tramp = Mod.getFunction(TrampName);
+        if (!Tramp) {
+            Tramp = Function::Create(TrampTy, GlobalValue::InternalLinkage, TrampName, &Mod);
+
+            BasicBlock *TBB = BasicBlock::Create(Ctx, "entry", Tramp);
+            IRBuilder<> BT(TBB);
+
+            // Y = input argument
+            Value *Y = Tramp->arg_begin();
+
+            // Allocate dummy closure with correct size and alignment
+            AllocaInst *Dummy = BT.CreateAlloca(ST, nullptr, "lambdaopt.dummy.closure");
+            const DataLayout &DL = Mod.getDataLayout();
+            uint64_t Size = DL.getTypeAllocSize(ST);
+            BT.CreateMemSet(Dummy, ConstantInt::get(Type::getInt8Ty(Ctx), 0), Size, MaybeAlign(Dummy->getAlign()));
+
+            // Call hot clone: i32 (%class.anon*, i32)
+            CallInst *CallHot = BT.CreateCall(HotClone, {Dummy, Y});
+            BT.CreateRet(CallHot);
+        }
+
+        // === Split original block ===
+
         BasicBlock *OrigBB = CI->getParent();
         BasicBlock *ColdBB = OrigBB->splitBasicBlock(CI, "lambdaopt.cold");
 
-        // ColdBB should end with the original 'ret void'
-        auto *ColdTerm = dyn_cast<ReturnInst>(ColdBB->getTerminator());
-        if (!ColdTerm || ColdTerm->getReturnValue() != nullptr) {
-            errs() << "lambdaopt: unexpected terminator in cold block; "
-                      "skipping ctor rewrite.\n";
+        ReturnInst *ColdRet = dyn_cast<ReturnInst>(ColdBB->getTerminator());
+        if (!ColdRet) {
+            errs() << "lambdaopt: unexpected terminator (not ret);\n";
             return;
         }
 
-        // Create hot block
+        // New hot block
         BasicBlock *HotBB = BasicBlock::Create(Ctx, "lambdaopt.hot", ParentF);
 
-        // Replace OrigBB's unconditional branch (to ColdBB) with:
-        //   br i1 IsHot, label %lambdaopt.hot, label %lambdaopt.cold
-        Instruction *OldTerm = OrigBB->getTerminator(); // the "br label %lambdaopt.cold"
+        // Replace unconditional branch with conditional
+        Instruction *OldTerm = OrigBB->getTerminator();
         IRBuilder<> BCond(OldTerm);
 
         auto *CapTy = cast<IntegerType>(CaptureArg->getType()); // i64
@@ -224,42 +245,39 @@ void handleStdFunctionCtor(Module &M, CallInst *CI, CaptureProfileMap Profiles) 
         BCond.CreateCondBr(IsHot, HotBB, ColdBB);
         OldTerm->eraseFromParent();
 
-        // ---- Cold path: DO WHAT IT DID BEFORE ----
-        //
-        // We do *not* touch ColdBB other than its new predecessor.
-        // It still:
-        //   - executes the original ctor call CI as its first inst
-        //   - then executes 'ret void'
-        // So cold behavior is identical to the original program.
+        // === Cold path ===
+        // remains untouched except its predecessor is now conditional
+        //      [CI call]
+        //      ret void
 
-        // ---- Hot path: construct std::function from HotClone and return ----
+        // === Hot path ===
 
         IRBuilder<> BHot(HotBB);
 
-        // "this" pointer for std::function, same as original ctor's first arg
-        Value *ThisPtr = CI->getArgOperand(0); // ptr %"class.std::__1::function"
+        // "this" for std::function
+        Value *ThisPtr = CI->getArgOperand(0);
 
-        // int (*)(int) type
-        Type *IntTy = Type::getInt32Ty(Ctx);
+        // FP type: int(*)(int)
         FunctionType *FnTy = FunctionType::get(IntTy, {IntTy}, false);
         PointerType *FnPtrTy = PointerType::getUnqual(FnTy);
 
-        // Bitcast HotClone to int (*)(int)
-        Value *HotFnPtr = BHot.CreateBitCast(HotClone, FnPtrTy);
+        // Tramp is already correct signature
+        Value *HotFnPtr = Tramp;
+        if (Tramp->getType() != FnPtrTy)
+            HotFnPtr = BHot.CreateBitCast(Tramp, FnPtrTy);
 
-        // Helper type: std::function<int(int)>* (std::function<int(int)>*, int (*)(int))
-        Type *ThisPtrTy = ThisPtr->getType();
-        FunctionType *HelperTy = FunctionType::get(CI->getType(), // same as ctor: ptr
-                                                   {ThisPtrTy, FnPtrTy}, false);
+        // helper: std::function<int(int)>* (std::function<int(int)>*, int(*)(int))
+        FunctionType *HelperTy = FunctionType::get(CI->getType(), {ThisPtr->getType(), FnPtrTy}, false);
 
         FunctionCallee Helper = Mod.getOrInsertFunction("lambdaopt_init_function_from_fp", HelperTy);
 
-        // Call helper; we ignore the returned pointer, just like the original ctor.
         CallInst *HotCall = BHot.CreateCall(Helper, {ThisPtr, HotFnPtr});
         HotCall->setTailCallKind(CI->getTailCallKind());
 
-        // Function return must match the original function return ('ret void')
         BHot.CreateRetVoid();
+
+        // Original ctor call is redundant now
+        // CI->eraseFromParent();
 
         errs() << "Finished rewrite of the boi\n";
     }
