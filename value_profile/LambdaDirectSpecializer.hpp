@@ -6,7 +6,7 @@
 
 namespace lambdaopt {
 
-class DirectLambdaSpecializer {
+class DirectLambdaSpecializer : public llvm::PassInfoMixin<DirectLambdaSpecializer> {
   public:
     // Specialize direct lambda operator() calls based on hot capture values.
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
