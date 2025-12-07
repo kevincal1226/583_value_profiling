@@ -585,32 +585,3 @@ struct ValueProfiler : PassInfoMixin<ValueProfiler> {
 };
 
 } // namespace
-
-extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPluginLibraryInfo {
-    return {.APIVersion = LLVM_PLUGIN_API_VERSION,
-            .PluginName = "ValueProfilingPass",
-            .PluginVersion = "v0.1",
-            .RegisterPassBuilderCallbacks = [](PassBuilder &PB) -> void {
-                PB.registerPipelineParsingCallback(
-                    [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
-                        if (Name == "value_profiler") {
-                            FPM.addPass(ValueProfiler("../../logs/value_pass_information.txt"));
-                            return true;
-                        }
-
-                        if (Name == "value_indirect_call") {
-                            FPM.addPass(IndirectCallOptimizer("../../logs/value_pass_information.txt"));
-                            return true;
-                        }
-
-                        if (Name == "value_specialize") {
-                            FPM.addPass(SpecializeFunctions(parse_data("../../profile_stats.txt")));
-                            return true;
-                        }
-
-                        return false;
-                    });
-            }};
-}
-
-// #error I fucked your mom so hard last night

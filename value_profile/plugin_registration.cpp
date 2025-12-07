@@ -17,14 +17,34 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
             .PluginVersion = "v0.1",
             .RegisterPassBuilderCallbacks = [](PassBuilder &PB) -> void {
                 // Register FUNCTION PASS: value_profiler
+
                 PB.registerPipelineParsingCallback(
                     [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
                         if (Name == "value_profiler") {
-                            FPM.addPass(ValueProfiler(parse_data("../../profile_stats.txt")));
+                            FPM.addPass(ValueProfiler("../../logs/value_pass_information.txt"));
                             return true;
                         }
+
+                        if (Name == "value_indirect_call") {
+                            FPM.addPass(IndirectCallOptimizer("../../logs/value_pass_information.txt"));
+                            return true;
+                        }
+
+                        if (Name == "value_specialize") {
+                            FPM.addPass(SpecializeFunctions(parse_data("../../profile_stats.txt")));
+                            return true;
+                        }
+
                         return false;
                     });
+                // PB.registerPipelineParsingCallback(
+                //     [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
+                //         if (Name == "value_profiler") {
+                //             FPM.addPass(ValueProfiler(parse_data("../../profile_stats.txt")));
+                //             return true;
+                //         }
+                //         return false;
+                //     });
 
                 // Register MODULE PASS: lambda_capture_collector
                 PB.registerPipelineParsingCallback(
