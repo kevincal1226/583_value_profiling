@@ -1,11 +1,14 @@
+#include <functional>
 #include <iostream>
 
-auto multiply(int x, int y) {
-    int acc = 0;
-    for (int i = 0; i < 10; ++i) {
-        acc += (x * y * (i)) / (i % 3 + 1);
-    }
-    return acc;
+std::function<int()> multiply(int x, int y) {
+    return [x, y]() {
+        int acc = 0;
+        for (int i = 0; i < 10; ++i) {
+            acc += (x * y * (i)) / (i % 3 + 1);
+        }
+        return acc;
+    };
 }
 
 #define SIZE 1000
@@ -18,12 +21,12 @@ auto spmv() {
         for (int j = 0; j < SIZE; ++j) {
             if (i % 2 == 0 || j % 2 == 0 || i > 10) {
                 butts[i][j] = 0;
-            } else {
+            }
+            else {
                 butts[i][j] = rand() % 200;
             }
         }
     }
-
 
     int res[SIZE];
     for (int row = 0; row < SIZE; ++row) {
@@ -31,7 +34,7 @@ auto spmv() {
         for (int col = 0; col < SIZE; ++col) {
             int x = butts[row][col];
             int y = vec[row];
-            int r = multiply(x, y);
+            int r = multiply(x, y)();
             res[row] += r;
         }
     }
