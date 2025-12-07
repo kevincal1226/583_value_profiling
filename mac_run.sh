@@ -13,8 +13,6 @@ cmake -D CMAKE_C_CMPILER=/usr/bin/clang -D CMAKE_CXX_COMPILER=/usr/bin/clang++ .
 make
 cd ..
 
-./value_profile/run_profiler $1
-
 if [ ! -f "$LIB" ]; then
     echo "Could not find $LIB. Please build your pass or correct the path in the script."
     exit 1
@@ -25,7 +23,7 @@ PATH2LIB=$(realpath "$LIB")
 CURRENT_DIR=$(pwd)
 
 # Default to correctness pass
-SELECTED_PASS=value_profiler
+SELECTED_PASS=value_indirect_call
 flag_set=false
 generate_viz=false
 
@@ -128,18 +126,25 @@ opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.bc
 #            RUN YOUR PASS
 ##############################################
 
+# run the value profiler thing
+opt -S -load-pass-plugin="${PATH2LIB}" -passes="value_profiler" ${FILENAME}.bc -o ${FILENAME}.profiler.bc >/dev/null
+
+clang++ -fprofile-instr-generate ${FILENAME}.profiler.bc -o ${FILENAME}_profiler
+
+(gtimeout 0.5s ./${FILENAME}_profiler >/dev/null) || true
+
 # We now use the profile augmented bc file as input to your pass.
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_profiled.bc >/dev/null
 
 ##############################################
-#     RUN O2 OPTIMIZATIONS AFTER YOUR PASS
+#     RUN O3 OPTIMIZATIONS AFTER YOUR PASS
 ##############################################
-opt -S -passes='default<O2>' ${FILENAME}.value_profiled.bc -o ${FILENAME}.value_profiled.O2.bc
+opt -S -passes='default<O3>' ${FILENAME}.value_profiled.bc -o ${FILENAME}.value_profiled.O3.bc
 
 ##############################################
-#     RUN O2 OPTIMIZATIONS WITHOUT PASS
+#     RUN O3 OPTIMIZATIONS WITHOUT PASS
 ##############################################
-opt -S -passes='default<O2>' ${FILENAME}.bc -o ${FILENAME}.not_value_profiled.O2.bc
+opt -S -passes='default<O3>' ${FILENAME}.bc -o ${FILENAME}.not_value_profiled.O3.bc
 
 # Generate binary excutable before FPLICM: Unoptimzed code
 clang++ -fprofile-instr-generate ${FILENAME}.bc -o ${FILENAME}_not_value_profiled

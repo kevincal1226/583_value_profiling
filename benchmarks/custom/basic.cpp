@@ -1,4 +1,4 @@
-#include <stdio.h>
+#include <cstdio>
 
 int foo(int x) {
     return x + 8;
