@@ -11,15 +11,15 @@ auto multiply(int x, int y) {
 #define SIZE 1000
 
 int main() {
-    int butts[SIZE][SIZE];
+    int mtx[SIZE][SIZE];
     int vec[SIZE];
     for (int i = 0; i < SIZE; ++i) {
         vec[i] = i % 3 == 0 ? 0 : i;
         for (int j = 0; j < SIZE; ++j) {
             if (i % 2 == 0 || j % 2 == 0 || i > 10) {
-                butts[i][j] = 0;
+                mtx[i][j] = 0;
             } else {
-                butts[i][j] = rand() % 200;
+                mtx[i][j] = rand() % 200;
             }
         }
     }
@@ -29,7 +29,7 @@ int main() {
     for (int row = 0; row < SIZE; ++row) {
         res[row] = 0;
         for (int col = 0; col < SIZE; ++col) {
-            int x = butts[row][col];
+            int x = mtx[row][col];
             int y = vec[row];
             int r = multiply(x, y);
             res[row] += r;
