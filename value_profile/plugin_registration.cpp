@@ -1,7 +1,10 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 
+#include "LambdaDirectSpecializer.hpp"
+
 #include "lambda_capture_collector.cpp"
+
 #include "value_profiling.cpp"
 
 #include "LambdaEscapeOptimizer.hpp"
@@ -47,6 +50,7 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                     [](StringRef Name, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
                         if (Name == "lambda_optimizer") {
                             MPM.addPass(lambdaopt::LambdaEscapeOptimizer());
+                            MPM.addPass(lambdaopt::DirectLambdaSpecializer());
                             return true;
                         }
                         return false;
