@@ -17,7 +17,7 @@ extern "C" auto LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() -> ::llvm::PassPlugi
                  PB.registerPipelineParsingCallback(
                    [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
                        if (Name == "value_profiler") {
-                           FPM.addPass(ValueProfiler(parse_data("../../logs/value_pass_information.txt")));
+                           FPM.addPass(ValueProfiler(parse_data("../../profile_stats.txt")));
                            return true;
                        }
 
