@@ -107,10 +107,22 @@ opt -passes="pgo-instr-use" -o ${FILENAME}.profdata.bc -pgo-test-profile-file=${
 # We now use the profile augmented bc file as input to your pass.
 opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.profdata.bc -o ${FILENAME}.fplicm.bc >/dev/null
 
-# Generate binary excutable before FPLICM: Unoptimzed code
+# Generate binary executable BEFORE FPLICM (no optimizations)
 clang -fprofile-instr-generate ${FILENAME}.ls.bc -o ${FILENAME}_no_fplicm
-# Generate binary executable after FPLICM: Optimized code
+
+# *** Run your pass ***
+opt -S -load-pass-plugin="${PATH2LIB}" \
+    -passes="${SELECTED_PASS}" \
+    ${FILENAME}.profdata.bc -o ${FILENAME}.fplicm.bc >/dev/null
+
+# *** Run O2 optimizations AFTER your pass ***
+opt -passes='default<O2>' ${FILENAME}.fplicm.bc -o ${FILENAME}.fplicm.O2.bc
+
+# Generate binary executable AFTER FPLICM (your current version)
 clang -fprofile-instr-generate ${FILENAME}.fplicm.bc -o ${FILENAME}_fplicm
+
+# Generate binary executable AFTER FPLICM + O2
+clang -fprofile-instr-generate ${FILENAME}.fplicm.O2.bc -o ${FILENAME}_fplicm_O2
 
 generate_cfg_viz() {
     VIZ_TYPE=cfg
