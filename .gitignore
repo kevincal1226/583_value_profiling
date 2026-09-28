@@ -1,3 +1,14 @@
 build/
 dot/
 .DS_Store
+logs/
+*.bc
+*_fplicm
+*_prof
+*.profdata
+*.profraw
+*_output
+env/
+*_value_profiled
+*.dSYM/
+profile_stats.txt

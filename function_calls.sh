@@ -2,9 +2,18 @@
 # Run script for Homework 2 CSE 583 Fall 2025
 # e.g. sh run.sh benchmarks/correctness/hw2correct1.c
 set -e
+set -Eeuo pipefail
 
 # ACTION NEEDED: If the path is different, please update it here.
-LIB="build/value_profile/ValueProfilingPass.so"
+LIB="build/value_profile/ValueProfilingPass.dylib"
+
+mkdir -p build
+cd build
+cmake -D CMAKE_C_CMPILER=/usr/bin/clang -D CMAKE_CXX_COMPILER=/usr/bin/clang++ ..
+make
+cd ..
+
+./value_profile/run_profiler $1
 
 if [ ! -f "$LIB" ]; then
     echo "Could not find $LIB. Please build your pass or correct the path in the script."
@@ -16,7 +25,7 @@ PATH2LIB=$(realpath "$LIB")
 CURRENT_DIR=$(pwd)
 
 # Default to correctness pass
-SELECTED_PASS=value_profiler
+SELECTED_PASS=value_specialize
 flag_set=false
 generate_viz=false
 
@@ -75,6 +84,8 @@ fi
 
 SRC_FILE=$1
 FILE_BASENAME=$(basename $SRC_FILE)
+# this is to run cpp files and not just c files
+# FILENAME=$FILE_BASENAME
 FILENAME=${FILE_BASENAME%.*}
 
 cd $(dirname $SRC_FILE)
@@ -83,46 +94,63 @@ cd $(dirname $SRC_FILE)
 rm -f default.profraw *_prof *_fplicm *.bc *.profdata *_output *.ll
 
 # Convert source code to bitcode (IR).
-clang -emit-llvm -c ${FILENAME}.c -Xclang -disable-O0-optnone -o ${FILENAME}.bc -fno-discard-value-names
+# clang -emit-llvm -fno-discard-value-names -c ${FILENAME}.cpp -Xclang -disable-O0-optnone -o ${FILENAME}.bc
+#
+# # Canonicalize natural loops (Ref: llvm.org/doxygen/LoopSimplify_8h_source.html)
+# opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.ls.bc
+#
+# # Instrument profiler passes.
+# opt -passes='pgo-instr-gen,instrprof' ${FILENAME}.ls.bc -o ${FILENAME}.ls.prof.bc
+#
+# # Generate binary executable with profiler embedded
+# clang -fprofile-instr-generate ${FILENAME}.ls.prof.bc -o ${FILENAME}_prof
+#
+# # When we run the profiler embedded executable, it generates a default.profraw file that contains the profile data.
+# ./${FILENAME}_prof >correct_output
+#
+# # Converting it to LLVM form. This step can also be used to combine multiple profraw files,
+# # in case you want to include different profile runs together.
+# llvm-profdata merge -o ${FILENAME}.profdata default.profraw
+#
+# # The "Profile Guided Optimization Use" pass attaches the profile data to the bc file.
+# opt -passes="pgo-instr-use" -o ${FILENAME}.profdata.bc -pgo-test-profile-file=${FILENAME}.profdata <${FILENAME}.ls.prof.bc >/dev/null
+#
+# # We now use the profile augmented bc file as input to your pass.
+# opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.profdata.bc -o ${FILENAME}.value_profiled.bc >/dev/null
+
+# Convert source code to bitcode (IR).
+clang -emit-llvm -fno-discard-value-names -c ${FILENAME}.cpp -Xclang -disable-O0-optnone -o ${FILENAME}.bc
 
 # Canonicalize natural loops (Ref: llvm.org/doxygen/LoopSimplify_8h_source.html)
-opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.ls.bc
+opt -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.bc
 
-# Instrument profiler passes.
-opt -passes='pgo-instr-gen,instrprof' ${FILENAME}.ls.bc -o ${FILENAME}.ls.prof.bc
-
-# Generate binary executable with profiler embedded
-clang -fprofile-instr-generate ${FILENAME}.ls.prof.bc -o ${FILENAME}_prof
-
-# When we run the profiler embedded executable, it generates a default.profraw file that contains the profile data.
-./${FILENAME}_prof >correct_output
-
-# Converting it to LLVM form. This step can also be used to combine multiple profraw files,
-# in case you want to include different profile runs together.
-llvm-profdata-20 merge -o ${FILENAME}.profdata default.profraw
-
-# The "Profile Guided Optimization Use" pass attaches the profile data to the bc file.
-opt -passes="pgo-instr-use" -o ${FILENAME}.profdata.bc -pgo-test-profile-file=${FILENAME}.profdata <${FILENAME}.ls.prof.bc >/dev/null
+##############################################
+#            RUN YOUR PASS
+##############################################
 
 # We now use the profile augmented bc file as input to your pass.
-opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.profdata.bc -o ${FILENAME}.fplicm.bc >/dev/null
+opt -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_profiled.bc >/dev/null
 
-# Generate binary executable BEFORE FPLICM (no optimizations)
-clang -fprofile-instr-generate ${FILENAME}.ls.bc -o ${FILENAME}_no_fplicm
+##############################################
+#     RUN O2 OPTIMIZATIONS AFTER YOUR PASS
+##############################################
+opt -S -passes='default<O2>' ${FILENAME}.value_profiled.bc -o ${FILENAME}.value_profiled.O2.bc
 
-# *** Run your pass ***
-opt -S -load-pass-plugin="${PATH2LIB}" \
-    -passes="${SELECTED_PASS}" \
-    ${FILENAME}.profdata.bc -o ${FILENAME}.fplicm.bc >/dev/null
+##############################################
+#     RUN O2 OPTIMIZATIONS WITHOUT PASS
+##############################################
+opt -S -passes='default<O2>' ${FILENAME}.bc -o ${FILENAME}.not_value_profiled.O2.bc
 
-# *** Run O2 optimizations AFTER your pass ***
-opt -passes='default<O2>' ${FILENAME}.fplicm.bc -o ${FILENAME}.fplicm.O2.bc
+# Generate binary excutable before FPLICM: Unoptimzed code
+clang++ -fprofile-instr-generate ${FILENAME}.bc -o ${FILENAME}_not_value_profiled
+# Generate binary executable after FPLICM: Optimized code
+clang++ -fprofile-instr-generate ${FILENAME}.value_profiled.bc -o ${FILENAME}_value_profiled
 
-# Generate binary executable AFTER FPLICM (your current version)
-clang -fprofile-instr-generate ${FILENAME}.fplicm.bc -o ${FILENAME}_fplicm
+# Binary AFTER your pass + O2
+clang++ -fprofile-instr-generate ${FILENAME}.value_profiled.O2.bc -o ${FILENAME}_value_profiled_O2
 
-# Generate binary executable AFTER FPLICM + O2
-clang -fprofile-instr-generate ${FILENAME}.fplicm.O2.bc -o ${FILENAME}_fplicm_O2
+# Binary O2 only
+clang++ -fprofile-instr-generate ${FILENAME}.not_value_profiled.O2.bc -o ${FILENAME}_O2
 
 generate_cfg_viz() {
     VIZ_TYPE=cfg

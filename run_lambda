@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Run script for Homework 2 CSE 583 Fall 2025
+# e.g. sh run.sh benchmarks/correctness/hw2correct1.c
+set -e
+set -Eeuo pipefail
+
+# ACTION NEEDED: If the path is different, please update it here.
+LIB="build/value_profile/ValueProfilingPass.dylib"
+
+# Prefer Homebrew LLVM tools so IR assembly matches the pass build.
+LLVM_BIN=${LLVM_BIN:-/opt/homebrew/opt/llvm/bin}
+CLANG=${CLANG:-${LLVM_BIN}/clang}
+CLANGXX=${CLANGXX:-${LLVM_BIN}/clang++}
+OPT=${OPT:-${LLVM_BIN}/opt}
+
+mkdir -p build
+cd build
+cmake -D CMAKE_C_CMPILER=/usr/bin/clang -D CMAKE_CXX_COMPILER=/usr/bin/clang++ ..
+make
+cd ..
+
+CURRENT_DIR=$(pwd)
+
+PATH2LIB=$(realpath "$LIB")
+SELECTED_PASS=lambda_capture_collector
+
+SRC_FILE=$1
+FILE_BASENAME=$(basename $SRC_FILE)
+# this is to run cpp files and not just c files
+# FILENAME=$FILE_BASENAME
+FILENAME=${FILE_BASENAME%.*}
+
+cd $(dirname $SRC_FILE)
+
+# Convert source code to bitcode (IR).
+${CLANG} -emit-llvm -fno-discard-value-names -c ${FILENAME}.cpp -Xclang -disable-O0-optnone -o ${FILENAME}.bc
+
+# Canonicalize natural loops (Ref: llvm.org/doxygen/LoopSimplify_8h_source.html)
+${OPT} -passes='loop-simplify' ${FILENAME}.bc -o ${FILENAME}.bc
+
+##############################################
+#            RUN YOUR PASS
+##############################################
+
+echo "
+
+
+
+
+##############################################
+##############################################
+##############################################
+
+RUNNING VALUE PROFILER PASS
+
+##############################################
+##############################################
+##############################################
+
+
+
+
+"
+
+# We now use the profile augmented bc file as input to your pass.
+${OPT} -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.lambda_profiler.bc >/dev/null
+
+# Generate binary executable after FPLICM: Optimized code
+${CLANGXX} -fprofile-instr-generate ${FILENAME}.lambda_profiler.bc -o ${FILENAME}_lambda_profiler
+
+##############################################
+#            RUN VALUE PROFILER
+##############################################
+
+echo "
+
+
+
+
+##############################################
+##############################################
+##############################################
+
+RUNNING PROFILER
+
+##############################################
+##############################################
+##############################################
+
+
+
+
+"
+
+(gtimeout 0.5s ./"${FILENAME}_lambda_profiler" >/dev/null) || true
+
+##############################################
+#            COLLECT RESULTS
+##############################################
+
+echo "
+
+
+
+
+##############################################
+##############################################
+##############################################
+
+COLLECTING RESULTS
+
+##############################################
+##############################################
+##############################################
+
+
+
+
+"
+
+cd ../..
+
+./value_profile/parse_lambda_logs.py logs/lambda_logs.txt
+
+##############################################
+#            OPTIMIZER TIME
+##############################################
+
+echo "
+
+
+
+
+##############################################
+##############################################
+##############################################
+
+RUNNING OPTIMIZER
+
+##############################################
+##############################################
+##############################################
+
+
+
+
+"
+
+cd $(dirname $SRC_FILE)
+
+SELECTED_PASS=lambda_optimizer
+${OPT} -S -load-pass-plugin="${PATH2LIB}" -passes="${SELECTED_PASS}" ${FILENAME}.bc -o ${FILENAME}.value_lambda_profiled.bc >/dev/null
+
+##############################################
+#            RUN O2
+##############################################
+
+# regular O2
+${OPT} -S -passes='default<O2>' ${FILENAME}.bc -o ${FILENAME}.O2.bc
+
+# O2 with our pass
+${OPT} -S -passes='default<O2>' ${FILENAME}.value_lambda_profiled.bc -o ${FILENAME}.value_lambda_profiled.O2.bc
+
+##############################################
+#            GENERATE EXECUTABLES
+##############################################
+
+${CLANGXX} -fprofile-instr-generate ${FILENAME}.value_lambda_profiled.bc -o ${FILENAME}_value_lambda_profiled
+
+${CLANGXX} -fprofile-instr-generate ${FILENAME}.value_lambda_profiled.O2.bc -o ${FILENAME}_value_lambda_profiled.O2
+
+${CLANGXX} -fprofile-instr-generate ${FILENAME}.O2.bc -o ${FILENAME}.O2

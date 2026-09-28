@@ -1,1 +1,10 @@
-add_llvm_pass_plugin(value_profile value_profile.cpp)
+add_llvm_pass_plugin(
+    ValueProfilingPass
+    value_profiling.cpp
+    lambda_capture_collector.cpp
+    lambda_optimizer.cpp
+    plugin_registration.cpp
+    LambdaCommon.cpp
+    LambdaEscapeOptimizer.cpp
+    LambdaDirectSpecializer.cpp
+)
